@@ -1,0 +1,38 @@
+# Ignore
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Config (keep example, ignore local instance)
+config.json
+!config.json.example
+
+# Distribution
+dist/
+build/
+*.egg-info/
+
+# Runtime
+.bridge.pid
+
+# Local tooling
+.claude/

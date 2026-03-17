@@ -1,0 +1,145 @@
+name: Build & Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - "version.json"
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: windows-latest
+
+    steps:
+      # ── Checkout ──────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Read version from __init__.py ─────────────────────────
+      - name: Extract version from app/__init__.py
+        id: version
+        shell: bash
+        run: |
+          VERSION=$(python -c "
+          with open('app/__init__.py') as f:
+              for line in f:
+                  if line.startswith('__version__'):
+                      print(line.split('=')[1].strip().strip('\"').strip(\"'\"))
+                      break
+          ")
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Detected version: $VERSION"
+
+      # ── Check if this version already has a release ───────────
+      - name: Check if release already exists
+        id: check
+        shell: bash
+        run: |
+          TAG="v${{ steps.version.outputs.version }}"
+          if git tag --list | grep -q "^${TAG}$"; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release $TAG already exists, skipping."
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "New version $TAG detected, proceeding with build."
+          fi
+
+      # ── Python Setup ──────────────────────────────────────────
+      - name: Set up Python 3.12
+        if: steps.check.outputs.exists == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install dependencies
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      # ── Build executable with PyInstaller ─────────────────────
+      - name: Build executable
+        if: steps.check.outputs.exists == 'false'
+        run: python build.py
+
+      # ── Compile installer with Inno Setup ─────────────────────
+      - name: Compile Inno Setup installer
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" installer.iss
+
+      # ── Find installer file ──────────────────────────────────
+      - name: Locate installer
+        if: steps.check.outputs.exists == 'false'
+        id: installer
+        shell: bash
+        run: |
+          FILE=$(ls installer_output/ZebraBridgeSetup_*.exe | head -1)
+          BASENAME=$(basename "$FILE")
+          echo "path=$FILE" >> "$GITHUB_OUTPUT"
+          echo "name=$BASENAME" >> "$GITHUB_OUTPUT"
+          echo "Found installer: $BASENAME"
+
+      # ── Create tag ────────────────────────────────────────────
+      - name: Create version tag
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag "${{ steps.version.outputs.tag }}"
+          git push origin "${{ steps.version.outputs.tag }}"
+
+      # ── Create GitHub Release ─────────────────────────────────
+      - name: Create GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: "Zebra Print Bridge ${{ steps.version.outputs.tag }}"
+          body: |
+            ## Zebra Print Bridge ${{ steps.version.outputs.tag }}
+
+            ### Installation
+            1. Download **${{ steps.installer.outputs.name }}** below.
+            2. Run the installer and follow the wizard.
+            3. Launch **Zebra Print Bridge** from the Start Menu.
+          files: ${{ steps.installer.outputs.path }}
+          draft: false
+          prerelease: false
+
+      # ── Update version.json on main ───────────────────────────
+      - name: Update version.json
+        if: steps.check.outputs.exists == 'false'
+        shell: bash
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          TAG: ${{ steps.version.outputs.tag }}
+          INSTALLER_NAME: ${{ steps.installer.outputs.name }}
+        run: |
+          DOWNLOAD_URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/${INSTALLER_NAME}"
+
+          python -c "
+          import json
+          data = json.load(open('version.json'))
+          data['version'] = '${VERSION}'
+          data['download_url'] = '${DOWNLOAD_URL}'
+          json.dump(data, open('version.json', 'w'), indent=2)
+          print('Updated version.json:')
+          print(json.dumps(data, indent=2))
+          "
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add version.json
+          git commit -m "ci: update version.json to ${TAG}"
+          git push origin main

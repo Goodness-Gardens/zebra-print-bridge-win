@@ -1,0 +1,22 @@
+# Zebra Print Bridge - Dependencies
+
+# Web Server
+fastapi>=0.100.0,<1.0.0
+uvicorn[standard]>=0.22.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
+
+# HTTP Client (for label preview API)
+httpx>=0.24.0,<1.0.0
+
+# Desktop GUI
+customtkinter>=5.2.0,<6.0.0
+packaging>=23.0,<25.0
+
+# Build (dev only – not needed at runtime)
+# pyinstaller>=6.0
+
+# Windows printing (win32print for local/USB printers)
+pywin32>=306; sys_platform == "win32"
+
+# Optional: For USB device access
+# pyusb>=1.2.0

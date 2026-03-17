@@ -1,0 +1,748 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Zebra Print Bridge - Test Client</title>
+    <style>
+      * {
+        box-sizing: border-box;
+        margin: 0;
+        padding: 0;
+      }
+
+      body {
+        font-family:
+          -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+        background: linear-gradient(135deg, #2f3d5f 0%, #3d2861 100%);
+        min-height: 100vh;
+        padding: 20px;
+      }
+
+      .container {
+        max-width: 900px;
+        margin: 0 auto;
+      }
+
+      h1 {
+        color: white;
+        text-align: center;
+        margin-bottom: 30px;
+        font-weight: 300;
+      }
+
+      .card {
+        background: white;
+        border-radius: 12px;
+        padding: 25px;
+        margin-bottom: 20px;
+        box-shadow: 0 10px 40px rgba(0, 0, 0, 0.2);
+      }
+
+      .card h2 {
+        color: #333;
+        margin-bottom: 20px;
+        font-size: 1.2em;
+        border-bottom: 2px solid #4a5db5;
+        padding-bottom: 10px;
+      }
+
+      .mode-badge {
+        display: inline-block;
+        background: #eef2ff;
+        color: #25306e;
+        border: 1px solid #4a5db5;
+        padding: 4px 10px;
+        border-radius: 6px;
+        font-size: 12px;
+        font-weight: 600;
+        margin-bottom: 12px;
+      }
+
+      .status-bar {
+        display: flex;
+        align-items: center;
+        gap: 15px;
+        margin-bottom: 20px;
+      }
+
+      .status-indicator {
+        width: 12px;
+        height: 12px;
+        border-radius: 50%;
+        background: #ccc;
+      }
+
+      .status-indicator.connected {
+        background: #34c759;
+        box-shadow: 0 0 10px #34c759;
+      }
+
+      .status-indicator.disconnected {
+        background: #ff3b30;
+      }
+
+      .form-group {
+        margin-bottom: 20px;
+      }
+
+      label {
+        display: block;
+        margin-bottom: 8px;
+        font-weight: 500;
+        color: #555;
+      }
+
+      input[type="text"] {
+        width: 100%;
+        padding: 12px;
+        border: 2px solid #e1e1e1;
+        border-radius: 8px;
+        font-size: 14px;
+        transition: border-color 0.3s;
+      }
+
+      input:focus,
+      textarea:focus {
+        outline: none;
+        border-color: #4a5db5;
+      }
+
+      textarea {
+        width: 100%;
+        min-height: 220px;
+        padding: 15px;
+        border: 2px solid #e1e1e1;
+        border-radius: 8px;
+        font-family: "Monaco", "Menlo", monospace;
+        font-size: 13px;
+        resize: vertical;
+        transition: border-color 0.3s;
+      }
+
+      .button-group {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+
+      button {
+        padding: 12px 24px;
+        border: none;
+        border-radius: 8px;
+        font-size: 14px;
+        font-weight: 600;
+        cursor: pointer;
+        transition: all 0.3s;
+      }
+
+      button.primary {
+        background: linear-gradient(135deg, #4a5db5 0%, #2c4fbf 100%);
+        color: white;
+      }
+
+      button.primary:hover {
+        transform: translateY(-2px);
+        box-shadow: 0 5px 20px rgba(44, 79, 191, 0.35);
+      }
+
+      button.secondary {
+        background: #f5f5f7;
+        color: #333;
+      }
+
+      button.secondary:hover {
+        background: #e5e5ea;
+      }
+
+      button:disabled {
+        opacity: 0.5;
+        cursor: not-allowed;
+        transform: none !important;
+      }
+
+      .response-area {
+        background: #11131d;
+        color: #00ff9f;
+        padding: 15px;
+        border-radius: 8px;
+        font-family: "Monaco", "Menlo", monospace;
+        font-size: 12px;
+        min-height: 100px;
+        max-height: 220px;
+        overflow-y: auto;
+      }
+
+      .stats {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+        gap: 15px;
+      }
+
+      .stat-box {
+        background: #f5f5f7;
+        padding: 15px;
+        border-radius: 8px;
+        text-align: center;
+      }
+
+      .stat-box .number {
+        font-size: 2em;
+        font-weight: 600;
+        color: #4a5db5;
+      }
+
+      .stat-box .label {
+        color: #666;
+        font-size: 0.85em;
+      }
+
+      .templates {
+        display: grid;
+        grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+        gap: 10px;
+      }
+
+      .template-btn {
+        padding: 10px;
+        background: #f0f0f5;
+        border: 2px solid #e1e1e1;
+        border-radius: 8px;
+        cursor: pointer;
+        transition: all 0.2s;
+        text-align: left;
+      }
+
+      .template-btn:hover {
+        border-color: #4a5db5;
+        background: #f3f6ff;
+      }
+
+      .template-btn .name {
+        font-weight: 600;
+        color: #333;
+      }
+
+      .template-btn .desc {
+        font-size: 0.8em;
+        color: #666;
+      }
+
+      .inline-form {
+        display: grid;
+        grid-template-columns: 1fr 1fr 1fr;
+        gap: 15px;
+      }
+
+      .hint {
+        color: #555;
+        font-size: 13px;
+        margin-top: -8px;
+        margin-bottom: 16px;
+      }
+
+      @media (max-width: 780px) {
+        .inline-form {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div class="container">
+      <h1>Zebra Print Bridge - Test Client</h1>
+
+      <div class="card">
+        <h2>Connection Status</h2>
+        <div class="mode-badge">Mode: Network & Local RAW Command</div>
+        <div class="status-bar">
+          <div class="status-indicator" id="statusIndicator"></div>
+          <span id="statusText">Checking connection...</span>
+        </div>
+        <div class="form-group">
+          <label for="serverUrl">Server URL</label>
+          <input
+            type="text"
+            id="serverUrl"
+            value=""
+            placeholder="http://localhost:5050"
+          />
+        </div>
+        <div class="button-group">
+          <button class="primary" onclick="checkConnection()">
+            Check Connection
+          </button>
+          <button class="secondary" onclick="openStatus()">
+            Open Status JSON
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Server Statistics</h2>
+        <div class="stats">
+          <div class="stat-box">
+            <div class="number" id="statPending">-</div>
+            <div class="label">Pending</div>
+          </div>
+          <div class="stat-box">
+            <div class="number" id="statCompleted">-</div>
+            <div class="label">Completed</div>
+          </div>
+          <div class="stat-box">
+            <div class="number" id="statFailed">-</div>
+            <div class="label">Failed</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Send RAW Command</h2>
+
+        <div class="inline-form">
+          <div class="form-group">
+            <label for="printerName">Printer Name (optional)</label>
+            <input
+              type="text"
+              id="printerName"
+              placeholder="e.g. ZDesigner ZD420"
+            />
+          </div>
+          <div class="form-group">
+            <label for="printerIp">Printer IP</label>
+            <input
+              type="text"
+              id="printerIp"
+              placeholder="192.168.1.100 or test"
+            />
+          </div>
+          <div class="form-group">
+            <label for="source">Source (optional)</label>
+            <input type="text" id="source" value="Test Client" />
+          </div>
+        </div>
+        <p class="hint">
+          If <strong>Printer Name</strong> is set, the server looks for it locally. If not found, it fails.
+          If <strong>Printer IP</strong> is set, it targets a network printer. Use <code>test</code> to simulate printing.
+        </p>
+
+        <div class="form-group">
+          <label for="rawCommand">Raw Command (ZPL/EPL/etc.)</label>
+          <textarea id="rawCommand" placeholder="Enter raw printer command...">
+^XA
+^FO50,50^A0N,50,50^FDHello World^FS
+^FO50,120^A0N,30,30^FDBridge API Print^FS
+^FO50,180^BY3^BCN,100,Y,N,N^FD1234567890^FS
+^XZ</textarea
+          >
+        </div>
+
+        <div class="button-group">
+          <button
+            class="secondary"
+            onclick="checkPrinterConnection()"
+            id="checkPrinterBtn"
+          >
+            Check Printer (/connection)
+          </button>
+          <button class="primary" onclick="sendJsonPrint()" id="sendJsonBtn">
+            Send JSON (/print)
+          </button>
+          <button class="secondary" onclick="sendRawPrint()" id="sendRawBtn">
+            Send RAW (/print/raw)
+          </button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Templates</h2>
+        <div class="templates">
+          <div class="template-btn" onclick="loadTemplate('simple')">
+            <div class="name">Simple Label</div>
+            <div class="desc">Text with barcode</div>
+          </div>
+          <div class="template-btn" onclick="loadTemplate('product')">
+            <div class="name">Product Label</div>
+            <div class="desc">Name, price, barcode</div>
+          </div>
+          <div class="template-btn" onclick="loadTemplate('shipping')">
+            <div class="name">Shipping Label</div>
+            <div class="desc">Address with QR code</div>
+          </div>
+          <div class="template-btn" onclick="loadTemplate('asset')">
+            <div class="name">Asset Tag</div>
+            <div class="desc">ID with barcode</div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Response Log</h2>
+        <div class="button-group" style="margin-bottom: 12px">
+          <button class="secondary" onclick="clearLogs()" id="clearLogsBtn">
+            Clear Logs
+          </button>
+        </div>
+        <div class="response-area" id="responseLog">Waiting for requests...</div>
+      </div>
+    </div>
+
+    <script>
+      const templates = {
+        simple: `^XA
+^FO50,50^A0N,50,50^FDHello World^FS
+^FO50,120^A0N,30,30^FDBridge API Print^FS
+^FO50,180^BY3^BCN,100,Y,N,N^FD1234567890^FS
+^XZ`,
+        product: `^XA
+^FO50,30^A0N,40,40^FDProduct Name^FS
+^FO50,80^A0N,25,25^FDSKU: PRD-12345^FS
+^FO50,120^A0N,60,60^FD$19.99^FS
+^FO50,200^BY3^BCN,80,Y,N,N^FD123456789012^FS
+^XZ`,
+        shipping: `^XA
+^FO50,30^A0N,35,35^FDShip To:^FS
+^FO50,70^A0N,30,30^FDJohn Doe^FS
+^FO50,105^A0N,25,25^FD123 Main Street^FS
+^FO50,135^A0N,25,25^FDNew York, NY 10001^FS
+^FO50,180^BQN,2,5^FDLA,https://track.example.com/123^FS
+^XZ`,
+        asset: `^XA
+^FO50,30^A0N,40,40^FDASSET TAG^FS
+^FO50,80^A0N,25,25^FDDepartment: IT^FS
+^FO50,120^A0N,35,35^FDASSET-2024-001^FS
+^FO50,180^BY2^BCN,80,Y,N,N^FDASSET2024001^FS
+^XZ`,
+      };
+
+      function loadTemplate(name) {
+        document.getElementById("rawCommand").value = templates[name];
+        log(`Loaded template: ${name}`);
+      }
+
+      function getDefaultServerUrl() {
+        const params = new URLSearchParams(window.location.search);
+        const fromParam = params.get("server");
+        if (fromParam) {
+          return fromParam.replace(/\/$/, "");
+        }
+
+        const { protocol, hostname, port } = window.location;
+        if (hostname && hostname !== "localhost" && hostname !== "127.0.0.1") {
+          if (port && port !== "5050") {
+            return `http://${hostname}:5050`;
+          }
+          return `${protocol}//${hostname}${port ? `:${port}` : ""}`;
+        }
+
+        return "http://localhost:5050";
+      }
+
+      function getServerUrl() {
+        return document.getElementById("serverUrl").value.replace(/\/$/, "");
+      }
+
+      function log(message, isError = false) {
+        const logDiv = document.getElementById("responseLog");
+        const timestamp = new Date().toLocaleTimeString();
+        const color = isError ? "#ff4444" : "#00ff9f";
+        logDiv.innerHTML =
+          `<span style="color: ${color}">[${timestamp}] ${message}</span>\n` +
+          logDiv.innerHTML;
+      }
+
+      function resetLocalLog() {
+        document.getElementById("responseLog").textContent = "Waiting for requests...";
+      }
+
+      function isValidIpv4(ip) {
+        const parts = ip.split(".");
+        if (parts.length !== 4) {
+          return false;
+        }
+        for (const p of parts) {
+          if (!/^\d+$/.test(p)) {
+            return false;
+          }
+          const value = parseInt(p, 10);
+          if (value < 0 || value > 255) {
+            return false;
+          }
+        }
+        return true;
+      }
+
+      function isValidTarget(value) {
+        const target = (value || "").trim().toLowerCase();
+        if (target === "test") {
+          return true;
+        }
+        return isValidIpv4(value);
+      }
+
+      function getPrinterName() {
+        return document.getElementById("printerName").value.trim();
+      }
+
+      function getPrinterIp() {
+        return document.getElementById("printerIp").value.trim();
+      }
+
+      function getSource() {
+        return document.getElementById("source").value.trim() || "Test Client";
+      }
+
+      function getRawCommand() {
+        return document.getElementById("rawCommand").value;
+      }
+
+      function validateInputs() {
+        const printerName = getPrinterName();
+        const printerIp = getPrinterIp();
+        const rawCommand = getRawCommand();
+
+        if (!printerName && !printerIp) {
+          log("Printer Name or Printer IP is required", true);
+          return false;
+        }
+
+        if (printerName && printerIp) {
+          log("Please provide EITHER Printer Name OR Printer IP, not both.", true);
+          return false;
+        }
+
+        // If IP is provided, validate it
+        if (printerIp && !isValidTarget(printerIp)) {
+          log("Invalid Printer IP. Use IPv4 or 'test'", true);
+          return false;
+        }
+
+        if (!rawCommand.trim()) {
+          log("Raw command cannot be empty", true);
+          return false;
+        }
+
+        return true;
+      }
+
+      async function checkConnection() {
+        const indicator = document.getElementById("statusIndicator");
+        const statusText = document.getElementById("statusText");
+
+        try {
+          const response = await fetch(`${getServerUrl()}/info`);
+          const data = await response.json();
+
+          indicator.className = "status-indicator connected";
+          statusText.textContent = `Connected - ${data.mode || "raw_printing"}`;
+          log(`Connected to server: ${data.network_url || data.local_url}`);
+
+          refreshStats();
+        } catch (error) {
+          indicator.className = "status-indicator disconnected";
+          statusText.textContent = "Disconnected - " + error.message;
+          log(`Connection failed: ${error.message}`, true);
+        }
+      }
+
+      async function refreshStats() {
+        try {
+          const response = await fetch(`${getServerUrl()}/status`);
+          const data = await response.json();
+
+          document.getElementById("statPending").textContent =
+            data.pending_jobs || 0;
+          document.getElementById("statCompleted").textContent =
+            data.completed_jobs || 0;
+          document.getElementById("statFailed").textContent =
+            data.failed_jobs || 0;
+        } catch (error) {
+          console.error("Error fetching stats:", error);
+        }
+      }
+
+      async function sendJsonPrint() {
+        if (!validateInputs()) {
+          return;
+        }
+
+        const btn = document.getElementById("sendJsonBtn");
+        btn.disabled = true;
+        btn.textContent = "Sending JSON...";
+
+        const printerName = getPrinterName();
+        const printerIp = getPrinterIp();
+        const source = getSource();
+        const rawCommand = getRawCommand();
+
+        try {
+          if (printerName) localStorage.setItem("zebra_bridge_printer_name", printerName);
+          if (printerIp) localStorage.setItem("zebra_bridge_printer_ip", printerIp);
+
+          const payload = {
+            raw_command: rawCommand,
+            source,
+          };
+          if (printerName) payload.printer_name = printerName;
+          if (printerIp) payload.printer_ip = printerIp;
+
+          const response = await fetch(`${getServerUrl()}/print`, {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+            },
+            body: JSON.stringify(payload),
+          });
+
+          const data = await response.json();
+
+          if (response.ok && data.success) {
+            log(`JSON sent successfully - Job ID: ${data.job_id}`);
+          } else {
+            log(`JSON print failed: ${data.detail || data.message || "Unknown error"}`, true);
+          }
+
+          setTimeout(refreshStats, 1000);
+        } catch (error) {
+          log(`JSON print error: ${error.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Send JSON (/print)";
+        }
+      }
+
+      async function checkPrinterConnection() {
+        const printerName = getPrinterName();
+        const printerIp = getPrinterIp();
+
+        if (!printerName && !printerIp) {
+          log("Printer Name or Printer IP is required", true);
+          return;
+        }
+
+        const btn = document.getElementById("checkPrinterBtn");
+        btn.disabled = true;
+        btn.textContent = "Checking Printer...";
+
+        try {
+          if (printerName) localStorage.setItem("zebra_bridge_printer_name", printerName);
+          if (printerIp) localStorage.setItem("zebra_bridge_printer_ip", printerIp);
+
+          const params = new URLSearchParams();
+          if (printerName) params.set("printer_name", printerName);
+          if (printerIp) params.set("printer_ip", printerIp);
+
+          const url = `${getServerUrl()}/connection?${params.toString()}`;
+          const response = await fetch(url);
+          const data = await response.json();
+
+          if (response.ok && data.success) {
+            log(
+              `Printer connection OK: ${data.printer_type} ${data.printer_ip} (${data.latency_ms} ms) - ${data.message}`,
+            );
+          } else {
+            log(
+              `Printer connection failed: ${data.detail || data.message || "Unknown error"}`,
+              true,
+            );
+          }
+        } catch (error) {
+          log(`Printer connection error: ${error.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Check Printer (/connection)";
+        }
+      }
+
+      async function sendRawPrint() {
+        if (!validateInputs()) {
+          return;
+        }
+
+        const btn = document.getElementById("sendRawBtn");
+        btn.disabled = true;
+        btn.textContent = "Sending RAW...";
+
+        const printerIp = getPrinterIp();
+        const source = getSource();
+        const rawCommand = getRawCommand();
+
+        try {
+          localStorage.setItem("zebra_bridge_printer_ip", printerIp);
+
+          const url = `${getServerUrl()}/print/raw?printer_ip=${encodeURIComponent(printerIp)}&source=${encodeURIComponent(source)}`;
+          const response = await fetch(url, {
+            method: "POST",
+            headers: {
+              "Content-Type": "text/plain; charset=utf-8",
+            },
+            body: rawCommand,
+          });
+
+          const data = await response.json();
+
+          if (response.ok && data.success) {
+            log(`RAW sent successfully - Job ID: ${data.job_id}`);
+          } else {
+            log(`RAW print failed: ${data.detail || data.message || "Unknown error"}`, true);
+          }
+
+          setTimeout(refreshStats, 1000);
+        } catch (error) {
+          log(`RAW print error: ${error.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Send RAW (/print/raw)";
+        }
+      }
+
+      function openStatus() {
+        window.open(`${getServerUrl()}/status`, "_blank");
+      }
+
+      async function clearLogs() {
+        const btn = document.getElementById("clearLogsBtn");
+        if (!window.confirm("Clear server logs and dashboard history?")) {
+          return;
+        }
+
+        btn.disabled = true;
+        btn.textContent = "Clearing Logs...";
+
+        try {
+          const response = await fetch(`${getServerUrl()}/logs/clear`, {
+            method: "POST",
+          });
+          const data = await response.json();
+
+          if (!response.ok || !data.success) {
+            throw new Error(data.detail || data.message || "Unknown error");
+          }
+
+          resetLocalLog();
+          log(
+            `Logs cleared: files=${data.cleared_log_files.length}, runtime=${data.cleared_runtime_events}, history=${data.cleared_job_history}`,
+          );
+          document.getElementById("statPending").textContent = data.pending_jobs || 0;
+          document.getElementById("statCompleted").textContent =
+            data.completed_jobs || 0;
+          document.getElementById("statFailed").textContent = data.failed_jobs || 0;
+        } catch (error) {
+          log(`Clear logs failed: ${error.message}`, true);
+        } finally {
+          btn.disabled = false;
+          btn.textContent = "Clear Logs";
+        }
+      }
+
+      document.getElementById("serverUrl").value = getDefaultServerUrl();
+      document.getElementById("printerName").value =
+        localStorage.getItem("zebra_bridge_printer_name") || "";
+      document.getElementById("printerIp").value =
+        localStorage.getItem("zebra_bridge_printer_ip") || "";
+
+      checkConnection();
+      setInterval(refreshStats, 10000);
+    </script>
+  </body>
+</html>
