@@ -18,7 +18,15 @@ from pydantic import BaseModel
 
 from . import __version__
 from .config import get_platform_info
-from .utils import get_local_ip, normalize_target, normalize_raw_command
+from .utils import (
+    get_local_ip,
+    get_hostname,
+    is_valid_ipv4,
+    is_valid_hostname,
+    is_valid_target,
+    normalize_target,
+    normalize_raw_command,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,6 +35,7 @@ class PrintJob(BaseModel):
     """Model for JSON print job requests (supports legacy and new payloads)."""
 
     printer_ip: Optional[str] = None
+    printer_host: Optional[str] = None  # Network hostname or IP alias
     printer_name: Optional[str] = None  # Local/USB printer name installed in the OS
     raw_command: Optional[str] = None
     zpl: Optional[str] = None  # Legacy field name used by existing clients
@@ -191,7 +200,7 @@ class PrintServer:
                     "print": "/print (POST JSON)",
                     "print_raw": "/print/raw (POST plain text)",
                     "printers": "/printers (GET) — list OS-installed printers",
-                    "connection": "/connection?printer_ip=<IPv4|test>&printer_name=<name> (GET)",
+                    "connection": "/connection?printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
                     "status": "/status (GET)",
                     "health": "/health (GET)",
                     "info": "/info (GET)",
@@ -206,6 +215,8 @@ class PrintServer:
             request: Request,
             printer_ip: str = "",
             ip: Optional[str] = None,
+            printer_host: Optional[str] = None,
+            host: Optional[str] = None,
             printer_name: Optional[str] = None,
         ):
             """Check printer connectivity without sending a print job."""
@@ -240,7 +251,7 @@ class PrintServer:
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=str(e))
 
-            target = self._normalize_target(printer_ip or ip or "")
+            target = self._normalize_target(printer_ip or ip or printer_host or host or "")
             self._record_usage("connection_check_requested", printer_ip=target)
 
             client_host = request.client.host if request.client else None
@@ -278,7 +289,7 @@ class PrintServer:
                 else:
                     raise HTTPException(
                         status_code=400,
-                        detail="Valid printer_ip query parameter is required for remote requests (IPv4 or 'test')",
+                        detail="Valid printer_ip or printer_host query parameter is required for remote requests (IPv4, hostname, or 'test')",
                     )
 
             try:
@@ -329,13 +340,13 @@ class PrintServer:
                 raise HTTPException(status_code=500, detail="Print handler not configured")
 
             printer_name = (job.printer_name or "").strip() or None
-            printer_ip = self._normalize_target(job.printer_ip or "") or None
+            printer_ip = self._normalize_target(job.printer_ip or job.printer_host or "") or None
             raw_command = self._normalize_raw_command(job.raw_command or job.zpl or "")
 
             if not printer_name and not printer_ip:
                 raise HTTPException(
                     status_code=400,
-                    detail="Either printer_ip or printer_name is required",
+                    detail="Either printer_ip (or printer_host) or printer_name is required",
                 )
 
             if not raw_command.strip():
@@ -344,7 +355,7 @@ class PrintServer:
             client_host = request.client.host if request.client else None
             is_localhost = self._is_local_client(client_host)
 
-            # Auto-detect: if printer_ip is not a valid IP and request
+            # Auto-detect: if printer_ip is not a valid IP/hostname and request
             # comes from localhost, treat it as a local printer name.
             if printer_ip and not self._is_valid_target(printer_ip):
                 if is_localhost:
@@ -352,14 +363,14 @@ class PrintServer:
                         "json_print_auto_resolve_as_name",
                         original_printer_ip=printer_ip,
                     )
-                    # Move the non-IP value to printer_name (keep printer_ip empty)
+                    # Move the non-network value to printer_name (keep printer_ip empty)
                     if not printer_name:
                         printer_name = printer_ip
                     printer_ip = None
                 else:
                     raise HTTPException(
                         status_code=400,
-                        detail="Invalid printer_ip. Use IPv4 address or 'test'",
+                        detail="Invalid printer_ip. Use IPv4 address, hostname, or 'test'",
                     )
 
             self._record_usage(
@@ -413,7 +424,11 @@ class PrintServer:
                 raise HTTPException(status_code=400, detail="Empty raw command")
 
             printer_ip = self._normalize_target(
-                request.query_params.get("printer_ip") or request.query_params.get("ip") or ""
+                request.query_params.get("printer_ip")
+                or request.query_params.get("printer_host")
+                or request.query_params.get("ip")
+                or request.query_params.get("host")
+                or ""
             )
             source = request.query_params.get("source", "Raw API")
             request_id = request.query_params.get("id")
@@ -467,7 +482,7 @@ class PrintServer:
                 else:
                     raise HTTPException(
                         status_code=400,
-                        detail="Valid printer_ip query parameter is required (IPv4 or 'test')",
+                        detail="Invalid printer_ip. Use IPv4 address, hostname, or 'test'",
                     )
 
             try:
@@ -645,28 +660,23 @@ class PrintServer:
     @staticmethod
     def _is_valid_ipv4(ip: str) -> bool:
         """Validate IPv4 format and octet range."""
-        parts = ip.split(".")
-        if len(parts) != 4:
-            return False
-        if not all(part.isdigit() for part in parts):
-            return False
-        return all(0 <= int(part) <= 255 for part in parts)
+        return is_valid_ipv4(ip)
+
+    @staticmethod
+    def _is_valid_hostname(hostname: str) -> bool:
+        """Validate hostname format (RFC 1123 / mDNS)."""
+        return is_valid_hostname(hostname)
 
     @classmethod
     def _is_valid_target(cls, target: str) -> bool:
-        """Accept IPv4 targets and the special test destination."""
-        target_stripped = cls._normalize_target(target)
-        if not target_stripped:
-            return False
-        if target_stripped.lower() == "test":
-            return True
-        return cls._is_valid_ipv4(target_stripped)
+        """Accept IPv4 targets, network hostnames, optional port, and the special test destination."""
+        return is_valid_target(target)
 
     def _is_local_client(self, client_host: Optional[str]) -> bool:
         """Check if the request originates from the local machine.
 
-        Matches loopback addresses AND the machine's own LAN IP so that
-        a browser connecting via the network URL (e.g. http://192.168.1.20:5050)
+        Matches loopback addresses, hostname, AND the machine's own LAN IP so that
+        a browser connecting via the network URL or hostname (e.g. http://192.168.1.20:5050 or http://my-pc:5050)
         is still treated as a local request.
         """
         if client_host in ("127.0.0.1", "::1", "localhost", None):
@@ -674,6 +684,9 @@ class PrintServer:
         # Cache the LAN IP on first call
         if self._local_ip is None:
             self._local_ip = get_local_ip() or ""
+        hostname = get_hostname()
+        if client_host == hostname or (hostname and client_host == hostname.split(".")[0]):
+            return True
         return client_host == self._local_ip
 
     @staticmethod

@@ -116,6 +116,9 @@ class PrinterManager:
             sock.send(zpl.encode('utf-8'))
             logger.info("ZPL payload successfully sent to network printer %s:%s.", address, port)
             return True, None
+        except socket.gaierror as e:
+            logger.error("Cannot resolve hostname '%s': %s", address, e)
+            return False, f"Cannot resolve hostname '{address}': {e}"
         except socket.timeout:
             return False, "Connection timeout"
         except socket.error as e:
@@ -162,17 +165,41 @@ class PrinterManager:
     # ── Connection testing ───────────────────────────────────────────
 
     def _check_port_open(self, ip: str, port: int) -> bool:
-        """Quick check if port is open on given IP."""
+        """Quick check if port is open on given IP or hostname."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             try:
-                sock.settimeout(self.network_timeout)
+                timeout = max(self.network_timeout, 1.5)
+                sock.settimeout(timeout)
                 result = sock.connect_ex((ip, port))
                 return result == 0
             finally:
                 sock.close()
         except Exception:
             return False
+
+    def _test_network_connection(self, address: str, port: int) -> Tuple[bool, str]:
+        """Test TCP connection to a network printer by IP or hostname with descriptive error reporting."""
+        if not address:
+            return False, "No printer address"
+
+        timeout = max(self.network_timeout, 1.5)
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            try:
+                sock.settimeout(timeout)
+                result = sock.connect_ex((address, port))
+                if result == 0:
+                    return True, f"Connected to {address}:{port}"
+                return False, f"Cannot connect to printer at {address}:{port}"
+            finally:
+                sock.close()
+        except socket.gaierror as e:
+            return False, f"Cannot resolve hostname '{address}': {e}"
+        except socket.timeout:
+            return False, f"Connection timeout reaching {address}:{port}"
+        except Exception as e:
+            return False, f"Error connecting to {address}:{port}: {e}"
 
     def test_connection(self, printer: Dict) -> Tuple[bool, str]:
         """Test connection to a printer."""
@@ -187,9 +214,7 @@ class PrinterManager:
         elif printer.get('type') == 'network':
             address = printer.get('address')
             port = printer.get('port', self.DEFAULT_PORT)
-            if self._check_port_open(address, port):
-                return True, f"Connected to {address}:{port}"
-            return False, "Cannot connect to printer"
+            return self._test_network_connection(address, port)
 
         return False, "Unknown printer type"
 

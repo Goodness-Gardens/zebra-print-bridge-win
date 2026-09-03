@@ -309,11 +309,11 @@
             />
           </div>
           <div class="form-group">
-            <label for="printerIp">Printer IP</label>
+            <label for="printerIp">Printer IP / Hostname</label>
             <input
               type="text"
               id="printerIp"
-              placeholder="192.168.1.100 or test"
+              placeholder="192.168.1.100, zebra-printer.local, or test"
             />
           </div>
           <div class="form-group">
@@ -323,7 +323,7 @@
         </div>
         <p class="hint">
           If <strong>Printer Name</strong> is set, the server looks for it locally. If not found, it fails.
-          If <strong>Printer IP</strong> is set, it targets a network printer. Use <code>test</code> to simulate printing.
+          If <strong>Printer IP / Hostname</strong> is set, it targets a network printer (by IPv4 or hostname). Use <code>test</code> to simulate printing.
         </p>
 
         <div class="form-group">
@@ -472,12 +472,32 @@
         return true;
       }
 
+      function isValidHostname(name) {
+        if (!name || name.length > 253) return false;
+        const clean = name.endsWith(".") ? name.slice(0, -1) : name;
+        const labels = clean.split(".");
+        const labelRegex = /^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?$/;
+        return labels.every(
+          (label) => label.length > 0 && label.length <= 63 && labelRegex.test(label)
+        );
+      }
+
       function isValidTarget(value) {
         const target = (value || "").trim().toLowerCase();
         if (target === "test") {
           return true;
         }
-        return isValidIpv4(value);
+        let host = (value || "").trim();
+        if (host.includes(":") && !host.endsWith("]")) {
+          const parts = host.split(":");
+          if (parts.length === 2 && /^\d+$/.test(parts[1])) {
+            const port = parseInt(parts[1], 10);
+            if (port >= 1 && port <= 65535) {
+              host = parts[0];
+            }
+          }
+        }
+        return isValidIpv4(host) || isValidHostname(host);
       }
 
       function getPrinterName() {
@@ -502,18 +522,18 @@
         const rawCommand = getRawCommand();
 
         if (!printerName && !printerIp) {
-          log("Printer Name or Printer IP is required", true);
+          log("Printer Name or Printer IP / Hostname is required", true);
           return false;
         }
 
         if (printerName && printerIp) {
-          log("Please provide EITHER Printer Name OR Printer IP, not both.", true);
+          log("Please provide EITHER Printer Name OR Printer IP / Hostname, not both.", true);
           return false;
         }
 
-        // If IP is provided, validate it
+        // If IP / hostname is provided, validate it
         if (printerIp && !isValidTarget(printerIp)) {
-          log("Invalid Printer IP. Use IPv4 or 'test'", true);
+          log("Invalid Printer IP / Hostname. Use IPv4, hostname, or 'test'", true);
           return false;
         }
 

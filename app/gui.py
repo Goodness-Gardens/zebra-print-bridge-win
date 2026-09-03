@@ -21,7 +21,7 @@ from app import __version__
 from app.config import Config, get_platform_info
 from app.main import PrintBridge, setup_logging
 from app.updater import check_for_updates_async, download_installer, launch_installer_and_exit
-from app.utils import get_local_ip
+from app.utils import get_local_ip, get_hostname
 
 # ── Appearance ───────────────────────────────────────────────────────────
 ctk.set_appearance_mode("light")
@@ -102,7 +102,7 @@ class ZebraBridgeApp(ctk.CTk):
         title_label.pack(anchor="w")
 
         self.subtitle_label = ctk.CTkLabel(
-            left, text=f"v{__version__}  •  Bridge Mode",
+            left, text=f"v{__version__}  •  Bridge Mode  •  Host: {get_hostname()}",
             font=ctk.CTkFont(size=13), text_color=TEXT_DIM,
         )
         self.subtitle_label.pack(anchor="w", pady=(2, 0))

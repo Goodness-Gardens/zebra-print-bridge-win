@@ -3,8 +3,11 @@ Shared utility functions for Zebra Print Bridge.
 Centralised here to avoid duplication across modules.
 """
 
+import re
 import socket
-from typing import Optional
+from typing import Optional, Tuple
+
+HOSTNAME_LABEL_REGEX = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?$")
 
 
 def get_local_ip() -> Optional[str]:
@@ -21,6 +24,70 @@ def get_local_ip() -> Optional[str]:
             return socket.gethostbyname(socket.gethostname())
         except Exception:
             return None
+
+
+def get_hostname() -> str:
+    """Get the local network hostname of this machine."""
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "localhost"
+
+
+def is_valid_ipv4(ip: str) -> bool:
+    """Validate if a string is a standard IPv4 address."""
+    parts = (ip or "").strip().split(".")
+    if len(parts) != 4:
+        return False
+    if not all(part.isdigit() for part in parts):
+        return False
+    return all(0 <= int(part) <= 255 for part in parts)
+
+
+def is_valid_hostname(hostname: str) -> bool:
+    """Validate if a string is a syntactically valid hostname or local network name (RFC 1123 / mDNS)."""
+    name = (hostname or "").strip()
+    if not name or len(name) > 253:
+        return False
+    if name.endswith("."):
+        name = name[:-1]
+    if not name:
+        return False
+    labels = name.split(".")
+    return all(
+        len(label) > 0
+        and len(label) <= 63
+        and bool(HOSTNAME_LABEL_REGEX.match(label))
+        for label in labels
+    )
+
+
+def parse_target_address_port(target: str, default_port: int = 9100) -> Tuple[str, int]:
+    """Extract host address and optional port from a target string."""
+    value = normalize_target(target)
+    if not value:
+        return "", default_port
+
+    if ":" in value and not value.endswith("]"):
+        parts = value.rsplit(":", 1)
+        if parts[1].isdigit():
+            port = int(parts[1])
+            if 1 <= port <= 65535:
+                return parts[0], port
+
+    return value, default_port
+
+
+def is_valid_target(target: str) -> bool:
+    """Accept IPv4 targets, network hostnames, optional port, and the special 'test' destination."""
+    value = normalize_target(target)
+    if not value:
+        return False
+    if value.lower() == "test":
+        return True
+
+    host, _ = parse_target_address_port(value)
+    return is_valid_ipv4(host) or is_valid_hostname(host)
 
 
 def normalize_target(target: str) -> str:
@@ -43,3 +110,4 @@ def normalize_raw_command(command: str) -> str:
     ):
         value = value[1:-1].strip()
     return value
+

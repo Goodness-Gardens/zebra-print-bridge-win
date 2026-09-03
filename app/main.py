@@ -22,7 +22,16 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.config import Config, get_platform_info
 from app.printer_manager import PrinterManager
 from app.server import PrintServer
-from app.utils import get_local_ip, normalize_target, normalize_raw_command
+from app.utils import (
+    get_local_ip,
+    get_hostname,
+    is_valid_ipv4,
+    is_valid_hostname,
+    is_valid_target,
+    normalize_target,
+    normalize_raw_command,
+    parse_target_address_port,
+)
 
 
 def setup_logging(log_level: str = "INFO", log_file: str = None):
@@ -178,13 +187,15 @@ class PrintBridge:
 
         self.logger.info("Zebra Print Bridge service stopped.")
 
-    def _build_network_printer(self, printer_ip: str) -> Dict:
-        """Build a transient network printer object from IP."""
+    def _build_network_printer(self, target: str) -> Dict:
+        """Build a transient network printer object from IP or hostname, supporting optional :port."""
+        address, port = parse_target_address_port(target, self.printer_manager.DEFAULT_PORT)
+        display_name = f"Printer @ {address}:{port}" if port != self.printer_manager.DEFAULT_PORT else f"Printer @ {address}"
         return {
-            "name": f"Printer @ {printer_ip}",
+            "name": display_name,
             "type": "network",
-            "address": printer_ip,
-            "port": self.printer_manager.DEFAULT_PORT,
+            "address": address,
+            "port": port,
             "status": "direct",
         }
 
@@ -321,7 +332,9 @@ class PrintBridge:
 
     def on_job_received(self, job_data: Dict) -> Dict:
         """Handle incoming print job from the server."""
-        printer_ip = normalize_target(job_data.get("printer_ip") or "")
+        printer_ip = normalize_target(
+            job_data.get("printer_ip") or job_data.get("printer_host") or ""
+        )
         printer_name = (job_data.get("printer_name") or "").strip()
         raw_command = normalize_raw_command(job_data.get("raw_command") or "")
         source = (job_data.get("source") or "Web").strip() or "Web"
@@ -363,9 +376,9 @@ class PrintBridge:
             else:
                 return {"success": False, "message": "printer_ip or printer_name is required"}
         else:
-            # Remote requests MUST use printer_ip.
+            # Remote requests MUST use printer_ip / printer_host.
             if not printer_ip:
-                return {"success": False, "message": "Remote request requires a valid printer_ip."}
+                return {"success": False, "message": "Remote request requires a valid printer_ip or printer_host."}
             use_local = False
             printer_name = None  # Ignore any provided local name
 
@@ -430,26 +443,33 @@ class PrintBridge:
 
         name = (printer_name or target or "").strip()
 
-        # Local printer path (only allowed if is_local=True or is_localhost=True and looking up by name)
-        if is_local or (is_localhost and name and not self.server._is_valid_ipv4(name) and name.lower() != "test"):
-            if name.lower() == "test":
-                latency_ms = round((perf_counter() - started_at) * 1000, 2)
-                self._record_runtime_event("connection_check_requested", printer_name="test")
-                self._record_runtime_event(
-                    "connection_check_completed",
-                    printer_name="test",
-                    printer_type="test",
-                    success=True,
-                    latency_ms=latency_ms,
-                )
-                return {
-                    "success": True,
-                    "printer_ip": "test",
-                    "printer_type": "test",
-                    "message": "Test printer ready (simulated)",
-                    "latency_ms": latency_ms,
-                }
+        # Check for simulated test target
+        if name.lower() == "test":
+            latency_ms = round((perf_counter() - started_at) * 1000, 2)
+            self._record_runtime_event("connection_check_requested", printer_name="test")
+            self._record_runtime_event(
+                "connection_check_completed",
+                printer_name="test",
+                printer_type="test",
+                success=True,
+                latency_ms=latency_ms,
+            )
+            return {
+                "success": True,
+                "printer_ip": "test",
+                "printer_type": "test",
+                "message": "Test printer ready (simulated)",
+                "latency_ms": latency_ms,
+            }
 
+        # Local printer path:
+        # Activated if is_local=True, or printer_name was explicitly provided without a target,
+        # or if on localhost and target is NOT a valid network target (e.g. contains spaces).
+        use_local_path = is_local or bool(printer_name and not target) or (
+            is_localhost and target and not self.server._is_valid_target(target)
+        )
+
+        if use_local_path:
             self._record_runtime_event("connection_check_requested", printer_name=name)
             success, message = self.printer_manager.test_local_connection(name)
             latency_ms = round((perf_counter() - started_at) * 1000, 2)

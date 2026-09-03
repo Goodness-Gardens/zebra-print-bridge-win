@@ -4,14 +4,14 @@ A lightweight desktop application that receives ZPL II commands from
 web applications and sends them directly to Zebra printers over the network via TCP/IP.
 
 > **Mode: Network & Local RAW command.**
-> Every print request specifies `printer_ip` (or `printer_name`) and `raw_command` directly.
+> Every print request specifies `printer_ip` (IPv4 or hostname), or `printer_name` (local OS printer), and `raw_command` directly.
 > No saved printers or complex printer management.
 
 ## Features
 
 - **Desktop GUI**: Modern dark-themed control panel (CustomTkinter)
 - **Embedded HTTP Server**: Receives ZPL commands from any web application
-- **Direct Network Printing**: Sends RAW commands directly to the printer IP on port 9100
+- **Direct Network Printing**: Sends RAW commands directly to the printer IP or hostname on port 9100
 - **Web Test Client**: Built-in browser UI for testing print jobs
 - **Auto-Updater**: Checks the GitHub repository directly for new versions and offers one-click updates
 - **Queued Processing**: Accepts incoming jobs and processes them in order
@@ -182,16 +182,16 @@ Server info including network address and required fields.
   "uptime": "2h 15m 30s",
   "required_fields": {
     "json_print": [
-      "printer_ip (IPv4 or 'test') OR printer_name (local OS printer)",
+      "printer_ip (IPv4, hostname, or 'test'; alias: printer_host) OR printer_name (local OS printer)",
       "raw_command (or legacy field 'zpl')"
     ],
-    "raw_print": ["printer_ip (query, IPv4 or 'test')", "raw body"]
+    "raw_print": ["printer_ip (query, IPv4, hostname, or 'test')", "raw body"]
   },
   "endpoints": {
     "print": "/print (POST JSON)",
     "print_raw": "/print/raw (POST plain text)",
     "printers": "/printers (GET) — list OS-installed printers",
-    "connection": "/connection?printer_ip=<IPv4|test>&printer_name=<name> (GET)",
+    "connection": "/connection?printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
     "status": "/status (GET)",
     "health": "/health (GET)",
     "info": "/info (GET)",
@@ -235,12 +235,14 @@ Queue metrics, runtime counters, and recent usage data.
 }
 ```
 
-#### `GET /connection?printer_ip=<IPv4|test>&printer_name=<name>`
+#### `GET /connection?printer_ip=<IPv4|hostname|test>&printer_name=<name>`
 
-Checks printer connectivity without sending any print job. Accepts either `printer_ip` or `printer_name` (local OS printer).
+Checks printer connectivity without sending any print job. Accepts either `printer_ip` (IPv4 or network hostname) or `printer_name` (local OS printer).
 
 ```bash
 curl "http://192.168.1.100:5050/connection?printer_ip=192.168.1.50"
+# or by network hostname
+curl "http://192.168.1.100:5050/connection?printer_ip=zebra-printer.local"
 # or
 curl "http://192.168.1.100:5050/connection?printer_name=Zebra_GK420d"
 ```
@@ -312,7 +314,7 @@ curl -X POST http://192.168.1.100:5050/print \
 
 | Parameter      | Type   | Required | Description                                              |
 |----------------|--------|----------|----------------------------------------------------------|
-| `printer_ip`   | string | \*\*     | Printer IPv4 address, or `"test"` for simulation         |
+| `printer_ip`   | string | \*\*     | Printer IPv4 address, network hostname (e.g. `zebra-zd420.local`), or `"test"` (alias: `printer_host`) |
 | `printer_name` | string | \*\*     | Name of local/USB printer installed in OS                |
 | `raw_command`  | string | Yes      | Raw ZPL command string (alias: `zpl` for legacy payload) |
 | `source`       | string | No       | Source label for tracking (default: `"Web API"`)         |
@@ -320,7 +322,7 @@ curl -X POST http://192.168.1.100:5050/print \
 | `dpi`          | int    | No       | Printer resolution (informational only)                  |
 | `label_size`   | object | No       | Label dimensions `{width, height}` (informational)       |
 
-\*\* *Either `printer_ip` or `printer_name` must be provided.*
+\*\* *Either `printer_ip` (or `printer_host`) or `printer_name` must be provided.*
 
 **Response:**
 
@@ -342,26 +344,26 @@ curl -X POST http://192.168.1.100:5050/print \
 
 #### `POST /print/raw`
 
-Send a raw ZPL command with the printer IP in the query string.
+Send a raw ZPL command with the printer IP or hostname in the query string.
 
 **Request:**
 
 ```bash
-curl -X POST "http://192.168.1.100:5050/print/raw?printer_ip=192.168.1.50&source=MyApp" \
+curl -X POST "http://192.168.1.100:5050/print/raw?printer_ip=zebra-printer.local&source=MyApp" \
   -H "Content-Type: text/plain; charset=utf-8" \
   --data-binary '^XA^FO50,50^A0N,50,50^FDHello^FS^XZ'
 ```
 
 **Query Parameters:**
 
-| Parameter    | Description                                      |
-|--------------|--------------------------------------------------|
-| `printer_ip` | Printer IPv4 address, or `"test"` (also: `ip`)  |
-| `source`     | Source label for tracking                        |
-| `id`         | Custom job ID                                    |
+| Parameter    | Description                                                           |
+|--------------|-----------------------------------------------------------------------|
+| `printer_ip` | Printer IPv4 address, network hostname, or `"test"` (aliases: `ip`, `printer_host`, `host`) |
+| `source`     | Source label for tracking                                             |
+| `id`         | Custom job ID                                                         |
 
 **Validation:**
-- `printer_ip` must be a valid IPv4 address or the special value `"test"`.
+- `printer_ip` must be a valid IPv4 address, network hostname, or the special value `"test"`.
 - Request body cannot be empty.
 - If `printer_ip` is not `"test"` and port `9100` is unreachable, the API returns `503 Service Unavailable`.
 
