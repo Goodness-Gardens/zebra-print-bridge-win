@@ -29,6 +29,7 @@ config.json
 # Distribution
 dist/
 build/
+installer_output/
 *.egg-info/
 
 # Runtime
