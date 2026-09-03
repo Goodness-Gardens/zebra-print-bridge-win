@@ -36,62 +36,63 @@ logger = logging.getLogger(__name__)
 
 def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     """
-    Probe a network IP on port 9100.
-    Queries Zebra SGD device.friendly_name and device.unique_id, with fallback to HTTP title.
-    Returns dict with printer details or None.
+    Probe a network IP for printer availability without sending any print payload.
+    - Uses passive TCP connect on port 9100 (WITHOUT sending any bytes) to test if the port is open.
+    - Uses reverse DNS and HTTP port 80 title check to discover the printer's friendly name/model.
+    - NEVER sends commands to port 9100, ensuring printers NEVER print spurious test labels.
     """
     friendly_name = ""
-    unique_id = ""
+    port_open = False
 
-    # 1. Probe port 9100 and query Zebra SGD
+    # 1. Passive TCP check on port 9100:
+    # CRITICAL: Never send any bytes (send/sendall) to port 9100!
+    # Non-Zebra or non-SGD printers treat port 9100 data as raw print jobs.
     try:
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         s.settimeout(timeout)
-        s.connect((ip, 9100))
-        try:
-            s.sendall(b'! U1 getvar "device.friendly_name"\r\n')
-            name_raw = s.recv(128).decode("utf-8", errors="ignore").strip()
-            name_val = name_raw.strip('"').strip()
-            if name_val and name_val != "?":
-                friendly_name = name_val
-
-            s.sendall(b'! U1 getvar "device.unique_id"\r\n')
-            uid_raw = s.recv(128).decode("utf-8", errors="ignore").strip()
-            uid_val = uid_raw.strip('"').strip()
-            if uid_val and uid_val != "?":
-                unique_id = uid_val
-        finally:
-            s.close()
+        result = s.connect_ex((ip, 9100))
+        s.close()
+        port_open = (result == 0)
     except Exception:
+        port_open = False
+
+    if not port_open:
         return None
 
-    # 2. Fallback to HTTP title if friendly name is not set
-    if not friendly_name:
-        try:
-            ctx = ssl.create_default_context()
-            ctx.check_hostname = False
-            ctx.verify_mode = ssl.CERT_NONE
-            req = urllib.request.Request(f"http://{ip}/", headers={"User-Agent": "ZebraPrintBridge/1.0"})
-            with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
-                html = r.read(2048).decode("utf-8", errors="ignore")
-                m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE)
-                if m:
-                    title = m.group(1).strip()
-                    clean = title.split(" - ")[0].strip()
-                    if clean and "setup" not in clean.lower():
-                        friendly_name = clean
-        except Exception:
-            pass
+    # 2. Reverse DNS lookup (harmless PTR query, completely safe)
+    try:
+        host, _, _ = socket.gethostbyaddr(ip)
+        if host:
+            clean_host = host.split(".")[0].strip()
+            if clean_host:
+                friendly_name = clean_host
+    except Exception:
+        pass
 
-    if friendly_name or unique_id:
-        return {
-            "name": friendly_name or unique_id,
-            "ip": ip,
-            "port": 9100,
-            "unique_id": unique_id,
-            "last_seen": datetime.now().isoformat(),
-        }
-    return None
+    # 3. Fallback to HTTP title on port 80 (read-only web traffic, completely safe)
+    try:
+        ctx = ssl.create_default_context()
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+        req = urllib.request.Request(f"http://{ip}/", headers={"User-Agent": "ZebraPrintBridge/1.0"})
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            html = r.read(2048).decode("utf-8", errors="ignore")
+            m = re.search(r"<title>(.*?)</title>", html, re.IGNORECASE)
+            if m:
+                title = m.group(1).strip()
+                clean = title.split(" - ")[0].strip()
+                if clean and "setup" not in clean.lower():
+                    friendly_name = clean
+    except Exception:
+        pass
+
+    return {
+        "name": friendly_name or f"Zebra Printer ({ip})",
+        "ip": ip,
+        "port": 9100,
+        "unique_id": "",
+        "last_seen": datetime.now().isoformat(),
+    }
 
 
 def get_local_subnets() -> List[ipaddress.IPv4Network]:
@@ -155,6 +156,7 @@ class PrinterManager:
         printer_aliases: Dict[str, str] = None,
     ):
         self.include_test_printer = include_test_printer
+        self.scan_network = scan_network
         self.saved_printers = saved_printers or []
         self.printer_aliases = {k.lower(): v for k, v in (printer_aliases or {}).items()}
         self.test_print_log: deque = deque(maxlen=100)
@@ -172,10 +174,13 @@ class PrinterManager:
         # Load persisted cache immediately on startup
         self._load_cache()
 
-        # Start continuous background discovery and sync thread
-        self._scanner_running = True
-        self._scanner_thread = threading.Thread(target=self._background_scanner_loop, daemon=True)
-        self._scanner_thread.start()
+        # Start continuous background discovery and sync thread (completely passive/safe)
+        self._scanner_running = False
+        self._scanner_thread = None
+        if self.scan_network:
+            self._scanner_running = True
+            self._scanner_thread = threading.Thread(target=self._background_scanner_loop, daemon=True)
+            self._scanner_thread.start()
 
     # ── Sending ──────────────────────────────────────────────────────
 
@@ -359,9 +364,21 @@ class PrinterManager:
 
         return discovered
 
+    def stop(self):
+        """Stop any background scanner threads cleanly."""
+        self._scanner_running = False
+        if self._scanner_thread and self._scanner_thread.is_alive():
+            try:
+                self._scanner_thread.join(timeout=1.0)
+            except Exception:
+                pass
+
     def _background_scanner_loop(self):
-        """Background thread keeping printer names and IPs synced in real time."""
+        """Background thread keeping printer names and IPs synced in real time (100% passive & harmless)."""
         time.sleep(1.0)
+        if not self._scanner_running:
+            return
+
         has_known = False
         with self._lock:
             has_known = bool(self._network_printers)
@@ -375,11 +392,13 @@ class PrinterManager:
         while self._scanner_running:
             time.sleep(30.0)  # poll every 30 seconds
             iteration += 1
+            if not self._scanner_running:
+                break
             try:
-                # Fast poll of known IPs (takes 50ms)
+                # Fast poll of known IPs (takes 50ms, 100% passive TCP check on port 9100)
                 self.refresh_known_printers()
 
-                # Full subnet scan every 15 minutes (30 iterations * 30s)
+                # Subnet scan every 15 minutes (30 iterations * 30s)
                 if iteration % 30 == 0:
                     self.scan_subnet()
             except Exception as e:
@@ -389,6 +408,7 @@ class PrinterManager:
         """
         Resolve a network printer name/hostname to IP address.
         Zero hardcoding: checks persistent dynamic cache, standard DNS, fast poll, and subnet scan.
+        All network probes are 100% passive and NEVER send bytes to port 9100.
         """
         if not address:
             return address
@@ -400,7 +420,7 @@ class PrinterManager:
 
         clean_lower = clean_addr.lower()
 
-        # 1. In-memory lookup from discovered & saved printers
+        # 1. In-memory lookup from discovered & saved printers / aliases
         with self._lock:
             if clean_lower in self._alias_map:
                 resolved = self._alias_map[clean_lower]
@@ -414,26 +434,7 @@ class PrinterManager:
         except socket.gaierror:
             pass
 
-        # 3. Not found in cache and DNS failed:
-        # Fast on-demand check on known printer IPs (<100ms) to see if an existing printer was renamed
-        logger.info("Printer alias '%s' not in cache. Refreshing known network printers...", clean_addr)
-        self.refresh_known_printers()
-        with self._lock:
-            if clean_lower in self._alias_map:
-                resolved = self._alias_map[clean_lower]
-                logger.info("Resolved printer alias '%s' -> %s after fast poll", clean_addr, resolved)
-                return resolved
-
-        # 4. If still not found, run a full subnet scan
-        logger.info("Printer alias '%s' still unknown. Scanning local subnet...", clean_addr)
-        self.scan_subnet()
-        with self._lock:
-            if clean_lower in self._alias_map:
-                resolved = self._alias_map[clean_lower]
-                logger.info("Resolved printer alias '%s' -> %s after subnet scan", clean_addr, resolved)
-                return resolved
-
-        # 5. Try mDNS suffixes (.local, .localdomain)
+        # 3. Try mDNS suffixes (.local, .localdomain)
         if not clean_addr.endswith(".local") and not clean_addr.endswith(".localdomain"):
             for suffix in (".local", ".localdomain"):
                 candidate = f"{clean_addr}{suffix}"
@@ -444,6 +445,25 @@ class PrinterManager:
                 except socket.gaierror:
                     pass
 
+        # 4. If still not found and scan_network is enabled, check network printers safely
+        if self.scan_network:
+            logger.info("Printer alias '%s' not in cache. Refreshing known network printers...", clean_addr)
+            self.refresh_known_printers()
+            with self._lock:
+                if clean_lower in self._alias_map:
+                    resolved = self._alias_map[clean_lower]
+                    logger.info("Resolved printer alias '%s' -> %s after fast poll", clean_addr, resolved)
+                    return resolved
+
+            logger.info("Printer alias '%s' still unknown. Scanning local subnet (passive)...", clean_addr)
+            self.scan_subnet()
+            with self._lock:
+                if clean_lower in self._alias_map:
+                    resolved = self._alias_map[clean_lower]
+                    logger.info("Resolved printer alias '%s' -> %s after subnet scan", clean_addr, resolved)
+                    return resolved
+
+        # Return original address (let socket connection report specific connectivity or gaierror)
         return clean_addr
 
     def _send_network(self, printer: Dict, zpl: str) -> Tuple[bool, Optional[str]]:

@@ -68,8 +68,8 @@ class PrintBridge:
         # Printer manager handles network and local OS printers
         self.printer_manager = PrinterManager(
             include_test_printer=False,
-            scan_network=False,
-            scan_usb=False,
+            scan_network=self.config.scan_network,
+            scan_usb=self.config.scan_usb,
             saved_printers=self.config.saved_printers,
             printer_aliases=self.config.get("printer_aliases", {}),
         )
@@ -185,6 +185,9 @@ class PrintBridge:
         if self.queue_thread and self.queue_thread.is_alive():
             self.queue_thread.join(timeout=5)
             self._record_runtime_event("queue_thread_joined", alive=self.queue_thread.is_alive())
+
+        if self.printer_manager:
+            self.printer_manager.stop()
 
         self.logger.info("Zebra Print Bridge service stopped.")
 
