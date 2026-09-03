@@ -8,7 +8,7 @@
 ; ──────────────────────────────────────────────────────────────
 
 #define MyAppName "Zebra Print Bridge"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.0"
 #define MyAppPublisher "ECXVII"
 #define MyAppURL "https://github.com/Goodness-Gardens/zebra-print-bridge-win"
 #define MyAppExeName "ZebraPrintBridge.exe"

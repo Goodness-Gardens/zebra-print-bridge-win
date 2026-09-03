@@ -70,7 +70,8 @@ class PrintBridge:
             include_test_printer=False,
             scan_network=False,
             scan_usb=False,
-            saved_printers=[],
+            saved_printers=self.config.saved_printers,
+            printer_aliases=self.config.get("printer_aliases", {}),
         )
 
         self.print_queue = queue.Queue()
@@ -190,11 +191,13 @@ class PrintBridge:
     def _build_network_printer(self, target: str) -> Dict:
         """Build a transient network printer object from IP or hostname, supporting optional :port."""
         address, port = parse_target_address_port(target, self.printer_manager.DEFAULT_PORT)
+        resolved_address = self.printer_manager.resolve_network_address(address)
         display_name = f"Printer @ {address}:{port}" if port != self.printer_manager.DEFAULT_PORT else f"Printer @ {address}"
         return {
             "name": display_name,
             "type": "network",
-            "address": address,
+            "address": resolved_address,
+            "original_target": address,
             "port": port,
             "status": "direct",
         }
@@ -523,8 +526,10 @@ class PrintBridge:
         }
 
     def list_printers(self) -> List[Dict]:
-        """List local/USB printers installed in the OS."""
-        return self.printer_manager.list_local_printers()
+        """List both dynamically discovered network Zebra printers and local/USB printers."""
+        network = self.printer_manager.list_network_printers()
+        local = self.printer_manager.list_local_printers()
+        return network + local
 
     def get_status(self) -> Dict:
         """Get current status for API."""
@@ -546,9 +551,12 @@ class PrintBridge:
             for j in all_jobs[:20]
         ]
 
+        server_hostname = get_hostname()
         return {
             "server_running": self.running,
             "mode": "raw_printing",
+            "server_hostname": server_hostname,
+            "hostname": server_hostname,
             "pending_jobs": stats_copy["pending"],
             "completed_jobs": stats_copy["completed"],
             "failed_jobs": stats_copy["failed"],

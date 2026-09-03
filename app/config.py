@@ -25,7 +25,8 @@ class Config:
         'network_timeout': 0.5,  # Increased for reliability
         'log_level': 'INFO',
         'web_interface': True,
-        'saved_printers': []  # List of saved printers {name, ip, port, type}
+        'saved_printers': [],
+        'printer_aliases': {}
     }
     
     def __init__(self, config_path: str = None):
@@ -163,9 +164,12 @@ class Config:
         logger.info(f"Removed printer: {name}")
     
     def get_saved_printer(self, name: str) -> Optional[Dict]:
-        """Get a saved printer by name"""
+        """Get a saved printer by name (case-insensitive)"""
+        if not name:
+            return None
+        target_name = name.strip().lower()
         printers = self._config.get('saved_printers', [])
-        return next((p for p in printers if p['name'] == name), None)
+        return next((p for p in printers if p.get('name', '').strip().lower() == target_name), None)
     
     def get(self, key: str, default=None):
         return self._config.get(key, default)

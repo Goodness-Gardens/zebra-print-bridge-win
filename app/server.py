@@ -51,6 +51,8 @@ class PrintResponse(BaseModel):
     success: bool
     job_id: Optional[str] = None
     message: Optional[str] = None
+    server_hostname: Optional[str] = None
+    hostname: Optional[str] = None  # Backward-compatible alias
 
 
 class ConnectionCheckResponse(BaseModel):
@@ -61,6 +63,8 @@ class ConnectionCheckResponse(BaseModel):
     printer_type: str
     message: str
     latency_ms: Optional[float] = None
+    server_hostname: Optional[str] = None
+    hostname: Optional[str] = None  # Backward-compatible alias
 
 
 class PrintServer:
@@ -145,10 +149,13 @@ class PrintServer:
                 self._record_usage("root_dashboard_redirected")
                 return RedirectResponse(url="/dashboard", status_code=307)
             self._record_usage("root_json_served")
+            server_hostname = get_hostname()
             return {
                 "status": "running",
                 "service": "Zebra Print Bridge",
                 "version": __version__,
+                "server_hostname": server_hostname,
+                "hostname": server_hostname,
                 "mode": "raw_printing",
             }
 
@@ -156,13 +163,18 @@ class PrintServer:
         async def get_status():
             """Get current server status and queue metrics."""
             self._record_usage("status_requested", log=False)
+            server_hostname = get_hostname()
             if self.on_status_request:
                 status = self.on_status_request()
+                status["server_hostname"] = server_hostname
+                status["hostname"] = server_hostname
                 status["uptime"] = self._get_uptime()
                 status["usage"] = self._get_usage_snapshot()
                 return status
             return {
                 "status": "running",
+                "server_hostname": server_hostname,
+                "hostname": server_hostname,
                 "uptime": self._get_uptime(),
                 "usage": self._get_usage_snapshot(),
             }
@@ -178,16 +190,23 @@ class PrintServer:
             self._record_usage("info_requested")
             local_ip = self._get_local_ip()
             platform_info = get_platform_info()
+            server_hostname = get_hostname()
 
             return {
                 "service": "Zebra Print Bridge",
                 "version": __version__,
+                "server_hostname": server_hostname,
+                "hostname": server_hostname,
                 "mode": "raw_printing",
                 "port": self.port,
+                "server_port": self.port,
+                "server_ip": local_ip,
+                "network_ip": local_ip,
+                "server_url": f"{local_ip}:{self.port}" if local_ip else f"localhost:{self.port}",
+                "server_url_host": f"{server_hostname}:{self.port}",
                 "local_url": f"http://localhost:{self.port}",
                 "network_url": f"http://{local_ip}:{self.port}" if local_ip else None,
-                "network_ip": local_ip,
-                "platform": platform_info.get("platform", "Linux"),
+                "platform": platform_info.get("platform", "Windows"),
                 "uptime": self._get_uptime(),
                 "required_fields": {
                     "json_print": [
@@ -275,12 +294,15 @@ class PrintServer:
                                 status_code=503,
                                 detail=result.get("message", "Unable to reach printer"),
                             )
+                        server_hostname = get_hostname()
                         return ConnectionCheckResponse(
                             success=result["success"],
                             printer_ip=result.get("printer_ip", target),
                             printer_type=result.get("printer_type", "local"),
                             message=result.get("message", "Connection check completed"),
                             latency_ms=result.get("latency_ms"),
+                            server_hostname=server_hostname,
+                            hostname=server_hostname,
                         )
                     except HTTPException:
                         raise
@@ -313,12 +335,15 @@ class PrintServer:
                     printer_type=result.get("printer_type"),
                     latency_ms=result.get("latency_ms"),
                 )
+                server_hostname = get_hostname()
                 return ConnectionCheckResponse(
                     success=result.get("success", False),
                     printer_ip=result.get("printer_ip", target),
                     printer_type=result.get("printer_type", "unknown"),
                     message=result.get("message", "Connection check completed"),
                     latency_ms=result.get("latency_ms"),
+                    server_hostname=server_hostname,
+                    hostname=server_hostname,
                 )
             except HTTPException:
                 raise
@@ -400,10 +425,13 @@ class PrintServer:
                     msg = result.get("message", "Print failed")
                     status_code = 404 if "not found" in msg.lower() else 503
                     raise HTTPException(status_code=status_code, detail=msg)
+                server_hostname = get_hostname()
                 return PrintResponse(
                     success=result.get("success", False),
                     job_id=result.get("job_id"),
                     message=result.get("message", "Job queued successfully"),
+                    server_hostname=server_hostname,
+                    hostname=server_hostname,
                 )
             except HTTPException:
                 raise
@@ -468,10 +496,13 @@ class PrintServer:
                                 status_code=status_code,
                                 detail=result.get("message", "Print failed"),
                             )
+                        server_hostname = get_hostname()
                         return {
                             "success": result.get("success", False),
                             "job_id": result.get("job_id"),
                             "message": result.get("message", "Job queued successfully"),
+                            "server_hostname": server_hostname,
+                            "hostname": server_hostname,
                         }
                     except HTTPException:
                         raise
@@ -511,10 +542,13 @@ class PrintServer:
                     success=result.get("success", False),
                     job_id=result.get("job_id"),
                 )
+                server_hostname = get_hostname()
                 return {
                     "success": result.get("success", False),
                     "job_id": result.get("job_id"),
                     "message": result.get("message", "Job queued successfully"),
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
                 }
             except HTTPException:
                 raise
@@ -579,7 +613,13 @@ class PrintServer:
                 )
             try:
                 printers = self.on_list_printers()
-                return {"printers": printers, "count": len(printers)}
+                server_hostname = get_hostname()
+                return {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    "count": len(printers),
+                    "printers": printers,
+                }
             except Exception as e:
                 logger.error("Error listing printers: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))

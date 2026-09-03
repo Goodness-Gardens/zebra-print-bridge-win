@@ -128,9 +128,12 @@ def download_installer(
 
 def launch_installer_and_exit(installer_path: Path):
     """Launch the downloaded installer and close the current application."""
-    logger.info("Executing update installer: %s", installer_path)
-    subprocess.Popen([str(installer_path)])
-    sys.exit(0)
+    if sys.platform == "win32":
+        logger.info("Executing update installer: %s", installer_path)
+        subprocess.Popen([str(installer_path)])
+        sys.exit(0)
+    else:
+        logger.info("Update installer downloaded to: %s. Automatic execution is only supported on Windows.", installer_path)
 
 
 def check_for_updates_async(callback: Callable[[Optional[Dict]], None]):

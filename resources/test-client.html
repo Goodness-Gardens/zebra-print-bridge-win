@@ -553,9 +553,9 @@
           const response = await fetch(`${getServerUrl()}/info`);
           const data = await response.json();
 
-          indicator.className = "status-indicator connected";
-          statusText.textContent = `Connected - ${data.mode || "raw_printing"}`;
-          log(`Connected to server: ${data.network_url || data.local_url}`);
+          const hostLabel = (data.server_hostname || data.hostname) ? ` (${data.server_hostname || data.hostname})` : "";
+          statusText.textContent = `Connected - ${data.mode || "raw_printing"}${hostLabel}`;
+          log(`Connected to server: ${data.network_url || data.local_url}${hostLabel}`);
 
           refreshStats();
         } catch (error) {
