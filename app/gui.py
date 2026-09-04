@@ -180,13 +180,14 @@ class ZebraBridgeApp(ctk.CTk):
         self.tabs = ctk.CTkTabview(self, corner_radius=12, fg_color=CARD_BG)
         self.tabs.pack(fill="both", expand=True, padx=16, pady=8)
 
-        # Tab 1: Printers & Devices
-        self.tab_printers = self.tabs.add("🖨  Devices & Printers")
-        # Tab 2: Activity Log
+        # Tab 1: Activity Log (Default View)
         self.tab_logs = self.tabs.add("📋  Activity Log")
+        # Tab 2: Printers & Devices
+        self.tab_printers = self.tabs.add("🖨  Devices & Printers")
 
-        self._build_printers_tab()
         self._build_logs_tab()
+        self._build_printers_tab()
+        self.tabs.set("📋  Activity Log")
 
     # ── PRINTERS TAB ─────────────────────────────────────────────────────
     def _build_printers_tab(self):
