@@ -181,9 +181,9 @@ class ZebraBridgeApp(ctk.CTk):
         self.tabs.pack(fill="both", expand=True, padx=16, pady=8)
 
         # Tab 1: Printers & Devices
-        self.tab_printers = self.tabs.add("🖨  Dispositivos e Impresoras")
+        self.tab_printers = self.tabs.add("🖨  Devices & Printers")
         # Tab 2: Activity Log
-        self.tab_logs = self.tabs.add("📋  Registro de Actividad")
+        self.tab_logs = self.tabs.add("📋  Activity Log")
 
         self._build_printers_tab()
         self._build_logs_tab()
@@ -197,13 +197,13 @@ class ZebraBridgeApp(ctk.CTk):
         toolbar.pack(fill="x", padx=10, pady=(6, 8))
 
         self.printers_status_label = ctk.CTkLabel(
-            toolbar, text="Cargando impresoras...",
+            toolbar, text="Loading printers...",
             font=ctk.CTkFont(size=12, weight="bold"), text_color=TEXT_DIM,
         )
         self.printers_status_label.pack(side="left", padx=4)
 
         self.scan_net_btn = ctk.CTkButton(
-            toolbar, text="🌐  Escanear Red", width=140, height=32,
+            toolbar, text="🌐  Scan Network", width=140, height=32,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=True),
@@ -211,7 +211,7 @@ class ZebraBridgeApp(ctk.CTk):
         self.scan_net_btn.pack(side="right", padx=(6, 0))
 
         self.refresh_btn = ctk.CTkButton(
-            toolbar, text="🔄  Actualizar", width=110, height=32,
+            toolbar, text="🔄  Refresh", width=110, height=32,
             font=ctk.CTkFont(size=12),
             fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
             corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=False),
@@ -231,11 +231,11 @@ class ZebraBridgeApp(ctk.CTk):
         net_header = ctk.CTkFrame(self.net_column, fg_color="transparent")
         net_header.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(
-            net_header, text="🌐  Impresoras de Red (Zebra TCP/IP)",
+            net_header, text="🌐  Network Printers (Zebra TCP/IP)",
             font=ctk.CTkFont(size=13, weight="bold"), text_color=TEXT_MAIN,
         ).pack(anchor="w")
         ctk.CTkLabel(
-            net_header, text="Detectadas en la red local vía puerto 9100",
+            net_header, text="Discovered on local network via port 9100",
             font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
         ).pack(anchor="w")
 
@@ -249,11 +249,11 @@ class ZebraBridgeApp(ctk.CTk):
         local_header = ctk.CTkFrame(self.local_column, fg_color="transparent")
         local_header.pack(fill="x", padx=12, pady=(10, 4))
         ctk.CTkLabel(
-            local_header, text="💻  Impresoras Locales del Sistema (Windows / USB)",
+            local_header, text="💻  Local System Printers (Windows / USB)",
             font=ctk.CTkFont(size=13, weight="bold"), text_color=TEXT_MAIN,
         ).pack(anchor="w")
         ctk.CTkLabel(
-            local_header, text="Dispositivos instalados en el sistema operativo",
+            local_header, text="Installed devices on operating system",
             font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
         ).pack(anchor="w")
 
@@ -268,7 +268,7 @@ class ZebraBridgeApp(ctk.CTk):
         header_row.pack(fill="x", padx=10, pady=(6, 6))
 
         ctk.CTkLabel(
-            header_row, text="📋  Registro de Actividad Reciente",
+            header_row, text="📋  Recent Activity Log",
             font=ctk.CTkFont(size=13, weight="bold"), text_color=TEXT_MAIN,
         ).pack(side="left")
 
@@ -319,14 +319,14 @@ class ZebraBridgeApp(ctk.CTk):
     def _set_scanning_state(self, is_scanning: bool):
         self.is_scanning_network = is_scanning
         if is_scanning:
-            self.scan_net_btn.configure(text="⏳  Escaneando...", state="disabled")
-            self.printers_status_label.configure(text="Escaneando la subred en busca de impresoras Zebra...")
+            self.scan_net_btn.configure(text="⏳  Scanning...", state="disabled")
+            self.printers_status_label.configure(text="Scanning subnet for Zebra printers...")
         else:
-            self.scan_net_btn.configure(text="🌐  Escanear Red", state="normal")
+            self.scan_net_btn.configure(text="🌐  Scan Network", state="normal")
             count_net = len(self.network_printers)
             count_loc = len(self.local_printers)
             self.printers_status_label.configure(
-                text=f"{count_net} en red detectada(s)  •  {count_loc} local(es) en Windows"
+                text=f"{count_net} network printer(s)  •  {count_loc} local printer(s)"
             )
 
     def _refresh_printers_async(self, force_subnet_scan: bool = False):
@@ -338,9 +338,9 @@ class ZebraBridgeApp(ctk.CTk):
             try:
                 if force_subnet_scan:
                     self.after(0, lambda: self._set_scanning_state(True))
-                    self._append_log_safe("[INFO] Iniciando escaneo de subred para impresoras Zebra...")
+                    self._append_log_safe("[INFO] Starting subnet scan for Zebra printers...")
                     self.bridge.printer_manager.scan_subnet()
-                    self._append_log_safe("[INFO] Escaneo de subred completado.")
+                    self._append_log_safe("[INFO] Subnet scan completed.")
                 else:
                     self.bridge.printer_manager.refresh_known_printers()
 
@@ -349,8 +349,8 @@ class ZebraBridgeApp(ctk.CTk):
 
                 self.after(0, lambda: self._render_printers(net, loc))
             except Exception as exc:
-                logger.error("Error al actualizar impresoras: %s", exc)
-                self._append_log_safe(f"[ERROR] Error al actualizar impresoras: {exc}")
+                logger.error("Error refreshing printers: %s", exc)
+                self._append_log_safe(f"[ERROR] Error refreshing printers: {exc}")
             finally:
                 self.after(0, lambda: self._set_scanning_state(False))
 
@@ -373,7 +373,7 @@ class ZebraBridgeApp(ctk.CTk):
             empty_frame.pack(fill="x", padx=4, pady=6)
             ctk.CTkLabel(
                 empty_frame,
-                text="No se han detectado impresoras Zebra en red.\nPresiona 'Escanear Red' para buscar en la subred.",
+                text="No Zebra network printers detected.\nClick 'Scan Network' to search subnet.",
                 font=ctk.CTkFont(size=12), text_color=TEXT_DIM, justify="center",
             ).pack(padx=16, pady=20)
         else:
@@ -386,7 +386,7 @@ class ZebraBridgeApp(ctk.CTk):
             empty_frame.pack(fill="x", padx=4, pady=6)
             ctk.CTkLabel(
                 empty_frame,
-                text="No se encontraron impresoras instaladas en el sistema.",
+                text="No local printers installed in system.",
                 font=ctk.CTkFont(size=12), text_color=TEXT_DIM, justify="center",
             ).pack(padx=16, pady=20)
         else:
@@ -408,7 +408,7 @@ class ZebraBridgeApp(ctk.CTk):
 
         # Status badge
         ctk.CTkLabel(
-            top_row, text="● En línea",
+            top_row, text="● Online",
             font=ctk.CTkFont(size=11, weight="bold"), text_color=GREEN,
         ).pack(side="right")
 
@@ -435,16 +435,16 @@ class ZebraBridgeApp(ctk.CTk):
         btn_row.pack(fill="x", padx=12, pady=(0, 10))
 
         copy_btn = ctk.CTkButton(
-            btn_row, text="📋 Copiar IP", width=95, height=26,
+            btn_row, text="📋 Copy IP", width=95, height=26,
             font=ctk.CTkFont(size=11),
             fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
             corner_radius=6,
         )
-        copy_btn.configure(command=lambda: self._copy_to_clipboard(ip, copy_btn, "📋 Copiar IP"))
+        copy_btn.configure(command=lambda: self._copy_to_clipboard(ip, copy_btn, "📋 Copy IP"))
         copy_btn.pack(side="left", padx=(0, 6))
 
         test_btn = ctk.CTkButton(
-            btn_row, text="🔌 Probar", width=80, height=26,
+            btn_row, text="🔌 Test", width=80, height=26,
             font=ctk.CTkFont(size=11),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             corner_radius=6,
@@ -468,10 +468,10 @@ class ZebraBridgeApp(ctk.CTk):
         # Status badge
         status = (p.get("status") or "available").lower()
         if status in ("ready", "available", "idle"):
-            status_text = "● Lista"
+            status_text = "● Ready"
             status_color = GREEN
         elif status == "paused":
-            status_text = "● Pausada"
+            status_text = "● Paused"
             status_color = YELLOW
         else:
             status_text = f"● {status.capitalize()}"
@@ -490,12 +490,12 @@ class ZebraBridgeApp(ctk.CTk):
         driver = p.get("driver") or "—"
 
         ctk.CTkLabel(
-            info_frame, text=f"Puerto / Conexión:  {port}",
+            info_frame, text=f"Port / Connection:  {port}",
             font=ctk.CTkFont(size=12), text_color=TEXT_DIM,
         ).pack(anchor="w")
 
         ctk.CTkLabel(
-            info_frame, text=f"Controlador:  {driver}",
+            info_frame, text=f"Driver:  {driver}",
             font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
         ).pack(anchor="w", pady=(1, 6))
 
@@ -504,16 +504,16 @@ class ZebraBridgeApp(ctk.CTk):
         btn_row.pack(fill="x", padx=12, pady=(0, 10))
 
         copy_btn = ctk.CTkButton(
-            btn_row, text="📋 Copiar Nombre", width=120, height=26,
+            btn_row, text="📋 Copy Name", width=120, height=26,
             font=ctk.CTkFont(size=11),
             fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
             corner_radius=6,
         )
-        copy_btn.configure(command=lambda: self._copy_to_clipboard(name, copy_btn, "📋 Copiar Nombre"))
+        copy_btn.configure(command=lambda: self._copy_to_clipboard(name, copy_btn, "📋 Copy Name"))
         copy_btn.pack(side="left", padx=(0, 6))
 
         test_btn = ctk.CTkButton(
-            btn_row, text="🔌 Probar", width=80, height=26,
+            btn_row, text="🔌 Test", width=80, height=26,
             font=ctk.CTkFont(size=11),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
             corner_radius=6,
@@ -526,13 +526,13 @@ class ZebraBridgeApp(ctk.CTk):
             self.clipboard_clear()
             self.clipboard_append(text)
             self.update_idletasks()
-            btn.configure(text="✔ Copiado!")
+            btn.configure(text="✔ Copied!")
             self.after(1400, lambda: btn.configure(text=original_text))
         except Exception as exc:
-            logger.error("Error al copiar al portapapeles: %s", exc)
+            logger.error("Failed to copy to clipboard: %s", exc)
 
     def _test_network_printer(self, p: Dict, btn: ctk.CTkButton):
-        btn.configure(text="Probando...", state="disabled")
+        btn.configure(text="Testing...", state="disabled")
         target_name = p.get("address") or p.get("name")
 
         def _worker():
@@ -540,21 +540,21 @@ class ZebraBridgeApp(ctk.CTk):
                 success, msg = self.bridge.printer_manager.test_connection(p)
                 status_text = "✔ OK" if success else "✖ Error"
                 self.after(0, lambda: btn.configure(text=status_text, state="normal"))
-                self.after(2500, lambda: btn.configure(text="🔌 Probar"))
-                self._append_log_safe(f"[INFO] Prueba de conexión a {target_name}: {msg}")
+                self.after(2500, lambda: btn.configure(text="🔌 Test"))
+                self._append_log_safe(f"[INFO] Connection test to {target_name}: {msg}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _test_local_printer(self, name: str, btn: ctk.CTkButton):
-        btn.configure(text="Probando...", state="disabled")
+        btn.configure(text="Testing...", state="disabled")
 
         def _worker():
             if self.bridge:
                 success, msg = self.bridge.printer_manager.test_local_connection(name)
-                status_text = "✔ OK" if success else "✖ Inactiva"
+                status_text = "✔ OK" if success else "✖ Inactive"
                 self.after(0, lambda: btn.configure(text=status_text, state="normal"))
-                self.after(2500, lambda: btn.configure(text="🔌 Probar"))
-                self._append_log_safe(f"[INFO] Prueba de impresora local '{name}': {msg}")
+                self.after(2500, lambda: btn.configure(text="🔌 Test"))
+                self._append_log_safe(f"[INFO] Local printer test '{name}': {msg}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
