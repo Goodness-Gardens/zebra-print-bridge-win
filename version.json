@@ -1,5 +1,5 @@
 {
-  "version": "1.1.0",
-  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.1.0/ZebraBridgeSetup_1.1.0.exe",
-  "notes": "Added support for network hostnames, custom ports, and improved printer connectivity."
+  "version": "1.2.0",
+  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.2.0/ZebraBridgeSetup_1.2.0.exe",
+  "notes": "Added GUI scanned network printers (hostname & IP) and local Windows devices list; removed unused code and dependencies."
 }

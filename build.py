@@ -17,7 +17,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent
 APP_NAME = "ZebraPrintBridge"
 ENTRY = ROOT / "run_gui.py"
-ICON = ROOT / "resources" / "icon.png"
 RESOURCES = ROOT / "resources"
 
 def get_version() -> str:

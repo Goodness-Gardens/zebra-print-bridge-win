@@ -5,7 +5,6 @@ Handles communication via Network (TCP/IP) and local OS-installed printers
 """
 
 import concurrent.futures
-from collections import deque
 from datetime import datetime
 import ipaddress
 import json
@@ -38,10 +37,11 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     """
     Probe a network IP for printer availability without sending any print payload.
     - Uses passive TCP connect on port 9100 (WITHOUT sending any bytes) to test if the port is open.
-    - Uses reverse DNS and HTTP port 80 title check to discover the printer's friendly name/model.
+    - Uses reverse DNS and HTTP port 80 title check to discover the printer's friendly name/model and hostname.
     - NEVER sends commands to port 9100, ensuring printers NEVER print spurious test labels.
     """
     friendly_name = ""
+    hostname = ""
     port_open = False
 
     # 1. Passive TCP check on port 9100:
@@ -63,7 +63,8 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     try:
         host, _, _ = socket.gethostbyaddr(ip)
         if host:
-            clean_host = host.split(".")[0].strip()
+            hostname = host.strip()
+            clean_host = hostname.split(".")[0].strip()
             if clean_host:
                 friendly_name = clean_host
     except Exception:
@@ -87,7 +88,8 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
         pass
 
     return {
-        "name": friendly_name or f"Zebra Printer ({ip})",
+        "name": friendly_name or (hostname.split(".")[0] if hostname else f"Zebra Printer ({ip})"),
+        "hostname": hostname,
         "ip": ip,
         "port": 9100,
         "unique_id": "",
@@ -137,30 +139,17 @@ class PrinterManager:
     # Default Zebra network port
     DEFAULT_PORT = 9100
 
-    # Test printer for development/debugging
-    TEST_PRINTER = {
-        'name': 'Zebra ZD420 (Test)',
-        'type': 'test',
-        'address': 'localhost',
-        'port': 9100,
-        'status': 'available',
-        'description': 'Simulated printer for testing'
-    }
-
     def __init__(
         self,
-        include_test_printer: bool = True,
         scan_network: bool = True,
-        scan_usb: bool = False,
+        network_timeout: float = 0.5,
         saved_printers: List[Dict] = None,
         printer_aliases: Dict[str, str] = None,
     ):
-        self.include_test_printer = include_test_printer
         self.scan_network = scan_network
+        self.network_timeout = network_timeout
         self.saved_printers = saved_printers or []
         self.printer_aliases = {k.lower(): v for k, v in (printer_aliases or {}).items()}
-        self.test_print_log: deque = deque(maxlen=100)
-        self.network_timeout = 0.5
 
         # Persistent printer cache directory and file
         self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
@@ -211,20 +200,10 @@ class PrinterManager:
 
     def _send_test(self, printer: Dict, zpl: str) -> Tuple[bool, Optional[str]]:
         """Simulate sending ZPL to a test printer."""
-        from datetime import datetime
-
-        print_job = {
-            'timestamp': datetime.now().isoformat(),
-            'printer': printer.get('name', 'Test Printer'),
-            'zpl': zpl,
-            'zpl_length': len(zpl)
-        }
-
-        self.test_print_log.append(print_job)
         logger.info("[TEST PRINTER] Processing simulated print job:")
+        logger.info("  - Target: %s", printer.get('name', 'Test Printer'))
         logger.info("  - ZPL Length: %d bytes", len(zpl))
         logger.info("  - ZPL Preview: %s...", zpl[:100])
-
         return True, None
 
     def _load_cache(self):
@@ -264,6 +243,7 @@ class PrinterManager:
         # 1. Discovered printers
         for ip, p in self._network_printers.items():
             name = p.get("name", "").strip()
+            host = p.get("hostname", "").strip()
             uid = p.get("unique_id", "").strip()
             if name:
                 name_lower = name.lower()
@@ -276,6 +256,12 @@ class PrinterManager:
                     prefixed = f"nh-{name_lower}"
                     if prefixed not in mapping:
                         mapping[prefixed] = ip
+            if host:
+                host_lower = host.lower()
+                mapping[host_lower] = ip
+                clean_host = host_lower.split(".")[0]
+                if clean_host not in mapping:
+                    mapping[clean_host] = ip
             if uid:
                 mapping[uid.lower()] = ip
 
@@ -414,7 +400,6 @@ class PrinterManager:
             return address
 
         clean_addr = address.strip()
-        from .utils import is_valid_ipv4
         if is_valid_ipv4(clean_addr):
             return clean_addr
 
@@ -569,20 +554,6 @@ class PrinterManager:
 
     # ── Connection testing ───────────────────────────────────────────
 
-    def _check_port_open(self, ip: str, port: int) -> bool:
-        """Quick check if port is open on given IP or hostname."""
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            try:
-                timeout = max(self.network_timeout, 1.5)
-                sock.settimeout(timeout)
-                result = sock.connect_ex((ip, port))
-                return result == 0
-            finally:
-                sock.close()
-        except Exception:
-            return False
-
     def _test_network_connection(self, address: str, port: int) -> Tuple[bool, str]:
         """Test TCP connection to a network printer by IP or hostname with descriptive error reporting."""
         if not address:
@@ -652,7 +623,9 @@ class PrinterManager:
                 printers.append({
                     "name": p.get("name", "Zebra Network Printer"),
                     "type": "network",
+                    "hostname": p.get("hostname", ""),
                     "address": p.get("ip"),
+                    "ip": p.get("ip"),
                     "port": p.get("port", self.DEFAULT_PORT),
                     "status": "ready",
                     "unique_id": p.get("unique_id", ""),
@@ -799,12 +772,4 @@ class PrinterManager:
 
         return None
 
-    # ── Test log helpers ─────────────────────────────────────────────
 
-    def get_test_print_log(self) -> List[Dict]:
-        """Get the log of simulated test prints."""
-        return list(self.test_print_log)
-
-    def clear_test_print_log(self):
-        """Clear the test print log."""
-        self.test_print_log.clear()

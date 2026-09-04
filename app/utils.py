@@ -90,24 +90,23 @@ def is_valid_target(target: str) -> bool:
     return is_valid_ipv4(host) or is_valid_hostname(host)
 
 
+def strip_wrapping_quotes(value: str) -> str:
+    """Remove accidental surrounding single or double quotes from a string."""
+    val = (value or "").strip()
+    while len(val) >= 2 and (
+        (val[0] == '"' and val[-1] == '"')
+        or (val[0] == "'" and val[-1] == "'")
+    ):
+        val = val[1:-1].strip()
+    return val
+
+
 def normalize_target(target: str) -> str:
     """Normalize printer target and remove accidental wrapping quotes."""
-    value = (target or "").strip()
-    while len(value) >= 2 and (
-        (value[0] == '"' and value[-1] == '"')
-        or (value[0] == "'" and value[-1] == "'")
-    ):
-        value = value[1:-1].strip()
-    return value
+    return strip_wrapping_quotes(target)
 
 
 def normalize_raw_command(command: str) -> str:
     """Normalize raw payload and remove accidental wrapping quotes."""
-    value = (command or "").strip()
-    while len(value) >= 2 and (
-        (value[0] == '"' and value[-1] == '"')
-        or (value[0] == "'" and value[-1] == "'")
-    ):
-        value = value[1:-1].strip()
-    return value
+    return strip_wrapping_quotes(command)
 

@@ -25,8 +25,6 @@ from app.server import PrintServer
 from app.utils import (
     get_local_ip,
     get_hostname,
-    is_valid_ipv4,
-    is_valid_hostname,
     is_valid_target,
     normalize_target,
     normalize_raw_command,
@@ -67,9 +65,8 @@ class PrintBridge:
 
         # Printer manager handles network and local OS printers
         self.printer_manager = PrinterManager(
-            include_test_printer=False,
             scan_network=self.config.scan_network,
-            scan_usb=self.config.scan_usb,
+            network_timeout=self.config.network_timeout,
             saved_printers=self.config.saved_printers,
             printer_aliases=self.config.get("printer_aliases", {}),
         )
@@ -332,10 +329,6 @@ class PrintBridge:
                 self.stats["pending"] = max(0, self.stats["pending"] - 1)
         self._record_runtime_event("job_failed", job_id=job_id, error=error)
 
-    def _get_local_ip(self) -> Optional[str]:
-        """Get local network IP."""
-        return get_local_ip()
-
     def on_job_received(self, job_data: Dict) -> Dict:
         """Handle incoming print job from the server."""
         printer_ip = normalize_target(
@@ -472,7 +465,7 @@ class PrintBridge:
         # Activated if is_local=True, or printer_name was explicitly provided without a target,
         # or if on localhost and target is NOT a valid network target (e.g. contains spaces).
         use_local_path = is_local or bool(printer_name and not target) or (
-            is_localhost and target and not self.server._is_valid_target(target)
+            is_localhost and target and not is_valid_target(target)
         )
 
         if use_local_path:
@@ -528,11 +521,17 @@ class PrintBridge:
             "latency_ms": latency_ms,
         }
 
+    def list_network_printers(self) -> List[Dict]:
+        """List dynamically discovered Zebra network printers."""
+        return self.printer_manager.list_network_printers()
+
+    def list_local_printers(self) -> List[Dict]:
+        """List local / OS-installed printers."""
+        return self.printer_manager.list_local_printers()
+
     def list_printers(self) -> List[Dict]:
         """List both dynamically discovered network Zebra printers and local/USB printers."""
-        network = self.printer_manager.list_network_printers()
-        local = self.printer_manager.list_local_printers()
-        return network + local
+        return self.list_network_printers() + self.list_local_printers()
 
     def get_status(self) -> Dict:
         """Get current status for API."""

@@ -12,7 +12,7 @@ from typing import Callable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
@@ -21,8 +21,6 @@ from .config import get_platform_info
 from .utils import (
     get_local_ip,
     get_hostname,
-    is_valid_ipv4,
-    is_valid_hostname,
     is_valid_target,
     normalize_target,
     normalize_raw_command,
@@ -605,7 +603,7 @@ class PrintServer:
 
         @app.get("/printers")
         async def list_printers():
-            """List local/USB printers installed in the OS."""
+            """List both network and local OS-installed printers."""
             self._record_usage("printers_list_requested")
             if not self.on_list_printers:
                 raise HTTPException(
@@ -614,11 +612,15 @@ class PrintServer:
             try:
                 printers = self.on_list_printers()
                 server_hostname = get_hostname()
+                network_printers = [p for p in printers if p.get("type") == "network"]
+                local_printers = [p for p in printers if p.get("type") == "local"]
                 return {
                     "server_hostname": server_hostname,
                     "hostname": server_hostname,
                     "count": len(printers),
                     "printers": printers,
+                    "network_printers": network_printers,
+                    "local_printers": local_printers,
                 }
             except Exception as e:
                 logger.error("Error listing printers: %s", e)
@@ -696,16 +698,6 @@ class PrintServer:
                     logger.error("Failed to clear log file %s: %s", base_filename, exc)
 
         return cleared_files
-
-    @staticmethod
-    def _is_valid_ipv4(ip: str) -> bool:
-        """Validate IPv4 format and octet range."""
-        return is_valid_ipv4(ip)
-
-    @staticmethod
-    def _is_valid_hostname(hostname: str) -> bool:
-        """Validate hostname format (RFC 1123 / mDNS)."""
-        return is_valid_hostname(hostname)
 
     @classmethod
     def _is_valid_target(cls, target: str) -> bool:
@@ -815,12 +807,6 @@ class PrintServer:
         """Signal Uvicorn to exit gracefully."""
         if self._uvicorn_server:
             self._uvicorn_server.should_exit = True
-
-    def run_in_thread(self):
-        """Run server in a background thread."""
-        thread = threading.Thread(target=self.run, daemon=True)
-        thread.start()
-        return thread
 
 
 if __name__ == "__main__":

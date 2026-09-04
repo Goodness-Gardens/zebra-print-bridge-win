@@ -7,14 +7,15 @@ import glob
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Callable, Dict, Optional
 from urllib.request import urlopen, Request
-from urllib.error import URLError
 
 from packaging.version import Version
 
@@ -45,7 +46,6 @@ def fetch_remote_version_info(url: str = VERSION_URL, timeout: int = 10) -> Opti
     }
     """
     try:
-        import time
         cache_buster_url = f"{url}?t={int(time.time())}"
         logger.info("Fetching remote version from: %s", cache_buster_url)
         req = Request(
@@ -118,7 +118,6 @@ def download_installer(
         logger.error("Update download failed. Reason: %s", exc)
         if tmp_dir_path and os.path.exists(tmp_dir_path):
             try:
-                import shutil
                 shutil.rmtree(tmp_dir_path, ignore_errors=True)
                 logger.info("Cleaned up incomplete update directory: %s", tmp_dir_path)
             except Exception as cleanup_exc:
@@ -159,7 +158,6 @@ def _cleanup_old_update_dirs():
         for d in glob.glob(os.path.join(tmp_root, "zbr_update_*")):
             if os.path.isdir(d):
                 try:
-                    import shutil
                     shutil.rmtree(d, ignore_errors=True)
                 except Exception:
                     pass
