@@ -214,6 +214,16 @@ class PrintBridge:
                     printer_name=local["name"],
                 )
                 return local
+            # Fallback to default OS printer if specific printer_name not found
+            default_local = self.printer_manager.get_default_local_printer()
+            if default_local:
+                self._record_runtime_event(
+                    "printer_target_resolved",
+                    printer_type="local",
+                    printer_name=default_local["name"],
+                    fallback_from=printer_name,
+                )
+                return default_local
             # Not found — return a sentinel so callers can handle
             self._record_runtime_event(
                 "printer_target_not_found",
@@ -275,10 +285,18 @@ class PrintBridge:
             else:
                 printer = self._build_printer_target(target)
 
-            # If local printer was not found in the OS, fail immediately
+            # If local printer was not found in the OS, attempt fallback to target printer_ip if present
             if printer.get("status") == "not_found":
-                self._mark_job_failed(job["id"], f"Printer '{printer_name}' not found in OS")
-                continue
+                if target and target.lower() != "test":
+                    self.logger.warning(
+                        "Local printer '%s' not found. Falling back to printer_ip '%s'.",
+                        printer_name, target
+                    )
+                    printer = self._build_printer_target(target)
+                    use_local = False
+                else:
+                    self._mark_job_failed(job["id"], f"Printer '{printer_name}' not found in OS and no fallback printer_ip available")
+                    continue
 
             self._record_runtime_event(
                 "job_dispatch_attempted",
@@ -290,11 +308,26 @@ class PrintBridge:
 
             if success:
                 if use_local:
-                    self.logger.info("Commands successfully sent to local printer: '%s'.", printer_name)
+                    self.logger.info("Commands successfully sent to local printer: '%s'.", printer.get("name", printer_name))
                 else:
                     self.logger.info("Job [%s] completed successfully.", job["id"])
                 self._mark_job_completed(job["id"])
             else:
+                # If local printer failed during dispatch, attempt fallback to printer_ip if provided
+                if use_local and target and target.lower() != "test":
+                    self.logger.warning(
+                        "Job [%s] failed on local printer '%s' (%s). Attempting fallback to printer_ip '%s'...",
+                        job["id"], printer_name, error, target
+                    )
+                    net_printer = self._build_printer_target(target)
+                    net_success, net_error = self.printer_manager.send_zpl(net_printer, job["raw_command"])
+                    if net_success:
+                        self.logger.info("Job [%s] completed successfully via fallback network printer '%s'.", job["id"], target)
+                        self._mark_job_completed(job["id"])
+                        continue
+                    else:
+                        error = f"Local print failed ({error}) and network fallback '{target}' also failed: {net_error}"
+
                 self.logger.error("Job [%s] failed. Reason: %s", job["id"], error)
                 self._mark_job_failed(job["id"], error or "Unknown print error")
 
@@ -330,7 +363,11 @@ class PrintBridge:
         self._record_runtime_event("job_failed", job_id=job_id, error=error)
 
     def on_job_received(self, job_data: Dict) -> Dict:
-        """Handle incoming print job from the server."""
+        """Handle incoming print job from the server with 3-tier printer resolution:
+        1. Primary: printer_name (if provided)
+        2. Fallback 1: Windows / OS Default Printer
+        3. Fallback 2: printer_ip / printer_host (network printer)
+        """
         printer_ip = normalize_target(
             job_data.get("printer_ip") or job_data.get("printer_host") or ""
         )
@@ -343,58 +380,106 @@ class PrintBridge:
 
         is_localhost = job_data.get("is_localhost", False)
 
-        if not printer_ip and not printer_name:
-            return {"success": False, "message": "printer_ip or printer_name is required"}
-
         if not raw_command.strip():
             return {"success": False, "message": "raw_command is required"}
 
-        # Resolution based on source
-        use_local = False
+        # Simulated test target check
         is_test = printer_ip.lower() == "test" or printer_name.lower() == "test"
+
+        use_local = False
+        resolved_local_name = None
 
         if is_test:
             printer_ip = "test"
             use_local = False
-        elif is_localhost:
-            # Localhost explicit rules
+            printer_name = "test"
+        else:
+            # ─────────────────────────────────────────────────────────────
+            # PRINTER RESOLUTION HIERARCHY:
+            # 1. Primary: Explicit printer_name
+            # 2. Fallback 1: Windows / OS Default Printer
+            # 3. Fallback 2: printer_ip (network printer)
+            # ─────────────────────────────────────────────────────────────
+
+            # 1. Primary: If printer_name is provided, search local OS printers
             if printer_name:
                 local = self.printer_manager.find_local_printer(printer_name)
                 if local:
                     use_local = True
+                    resolved_local_name = local["name"]
                     self._record_runtime_event(
                         "job_resolved_local_printer",
-                        printer_name=local["name"],
+                        printer_name=resolved_local_name,
                         source=source,
                     )
                 else:
-                    # Do not fallback if printer_name was explicitly provided but not found
-                    return {"success": False, "message": f"Printer '{printer_name}' not found locally."}
-            elif printer_ip:
-                use_local = False
-            else:
-                return {"success": False, "message": "printer_ip or printer_name is required"}
-        else:
-            # Remote requests MUST use printer_ip / printer_host.
-            if not printer_ip:
-                return {"success": False, "message": "Remote request requires a valid printer_ip or printer_host."}
-            use_local = False
-            printer_name = None  # Ignore any provided local name
+                    self.logger.warning(
+                        "Printer '%s' not found locally. Attempting fallback to default OS printer.",
+                        printer_name,
+                    )
+                    self._record_runtime_event(
+                        "job_fallback_default_printer_attempted",
+                        requested_printer=printer_name,
+                        source=source,
+                    )
 
-        # If not using local printer, validate the network target
-        if not use_local:
-            connection_result = self.check_connection(target=printer_ip, is_localhost=is_localhost)
-            if not connection_result.get("success", False):
-                message = connection_result.get("message", "Cannot connect to printer")
-                self._record_runtime_event(
-                    "job_rejected_unreachable_printer",
-                    printer_ip=printer_ip,
-                    source=source,
-                    error=message,
-                )
-                return {"success": False, "message": message}
+            # 2. Fallback 1: If not resolved locally and either printer_name was not found
+            #    or no specific printer_name was given (and no exclusive printer_ip specified)
+            if not use_local and not (printer_ip and not printer_name):
+                default_local = self.printer_manager.get_default_local_printer()
+                if default_local:
+                    use_local = True
+                    resolved_local_name = default_local["name"]
+                    if printer_name:
+                        self.logger.info(
+                            "Printer '%s' not found; fell back to default OS printer '%s'.",
+                            printer_name, resolved_local_name,
+                        )
+                    else:
+                        self.logger.info(
+                            "No printer_name specified; using default OS printer '%s'.",
+                            resolved_local_name,
+                        )
+                    self._record_runtime_event(
+                        "job_resolved_default_local_printer",
+                        printer_name=resolved_local_name,
+                        requested=printer_name or None,
+                        source=source,
+                    )
 
-        # Determine display target for logging
+            # 3. Fallback 2: If local resolution failed or printer_ip was targeted
+            if not use_local:
+                if printer_ip:
+                    # Validate network target
+                    connection_result = self.check_connection(target=printer_ip, is_localhost=is_localhost)
+                    if not connection_result.get("success", False):
+                        message = connection_result.get("message", "Cannot connect to printer")
+                        self._record_runtime_event(
+                            "job_rejected_unreachable_printer",
+                            printer_ip=printer_ip,
+                            source=source,
+                            error=message,
+                        )
+                        return {"success": False, "message": message}
+                    if printer_name:
+                        self.logger.info(
+                            "Printer '%s' and default OS printer not available; fell back to network printer '%s'.",
+                            printer_name, printer_ip,
+                        )
+                else:
+                    if printer_name:
+                        return {
+                            "success": False,
+                            "message": f"Printer '{printer_name}' not found locally, no default OS printer available, and no printer_ip provided.",
+                        }
+                    return {
+                        "success": False,
+                        "message": "No printer target found. Specify printer_name, configure a default OS printer, or provide printer_ip.",
+                    }
+
+        if use_local and resolved_local_name:
+            printer_name = resolved_local_name
+
         display_target = (printer_name if use_local else printer_ip) or printer_name or printer_ip
 
         job = {
@@ -463,14 +548,30 @@ class PrintBridge:
 
         # Local printer path:
         # Activated if is_local=True, or printer_name was explicitly provided without a target,
-        # or if on localhost and target is NOT a valid network target (e.g. contains spaces).
+        # or if target is NOT a valid network target (e.g. contains spaces or printer name).
         use_local_path = is_local or bool(printer_name and not target) or (
-            is_localhost and target and not is_valid_target(target)
+            target and not is_valid_target(target)
         )
 
         if use_local_path:
             self._record_runtime_event("connection_check_requested", printer_name=name)
             success, message = self.printer_manager.test_local_connection(name)
+
+            # If specific printer_name was not found, attempt fallback to default OS printer
+            if not success and printer_name:
+                default_local = self.printer_manager.get_default_local_printer()
+                if default_local and default_local["name"].lower() != name.lower():
+                    def_success, def_message = self.printer_manager.test_local_connection(default_local["name"])
+                    if def_success:
+                        latency_ms = round((perf_counter() - started_at) * 1000, 2)
+                        return {
+                            "success": True,
+                            "printer_ip": default_local["name"],
+                            "printer_type": "local",
+                            "message": f"Printer '{name}' not found; fell back to default OS printer '{default_local['name']}'",
+                            "latency_ms": latency_ms,
+                        }
+
             latency_ms = round((perf_counter() - started_at) * 1000, 2)
             self._record_runtime_event(
                 "connection_check_completed",
@@ -486,6 +587,20 @@ class PrintBridge:
                 "message": message,
                 "latency_ms": latency_ms,
             }
+
+        # Fallback if no target and no printer_name provided: test default OS printer
+        if not target and not printer_name:
+            default_local = self.printer_manager.get_default_local_printer()
+            if default_local:
+                success, message = self.printer_manager.test_local_connection(default_local["name"])
+                latency_ms = round((perf_counter() - started_at) * 1000, 2)
+                return {
+                    "success": success,
+                    "printer_ip": default_local["name"],
+                    "printer_type": "local",
+                    "message": f"Default OS printer '{default_local['name']}': {message}",
+                    "latency_ms": latency_ms,
+                }
 
         # Network printer path
         printer_ip = normalize_target(target or "")

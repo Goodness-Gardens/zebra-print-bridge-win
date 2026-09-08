@@ -636,13 +636,77 @@ class PrinterManager:
 
     # ── Local / OS-installed printer methods ──────────────────────────
 
+    def get_default_printer_name(self) -> Optional[str]:
+        """Get the name of the default printer configured in the OS."""
+        if platform.system() == "Windows" and _win32print is not None:
+            try:
+                name = _win32print.GetDefaultPrinter()
+                if name:
+                    return name.strip()
+            except Exception as e:
+                logger.debug("Failed to get Windows default printer name: %s", e)
+        elif platform.system() in ("Darwin", "Linux"):
+            try:
+                proc = subprocess.run(
+                    ["lpstat", "-d"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    timeout=5,
+                )
+                if proc.returncode == 0:
+                    match = re.search(r"system default destination:\s*(.+)", proc.stdout)
+                    if match:
+                        return match.group(1).strip()
+            except Exception as e:
+                logger.debug("Failed to get CUPS default printer: %s", e)
+        return None
+
+    def get_default_local_printer(self) -> Optional[Dict]:
+        """Get the default printer configured in the OS as a printer dict."""
+        default_name = self.get_default_printer_name()
+        if default_name:
+            printer = self.find_local_printer(default_name)
+            if printer:
+                printer_copy = dict(printer)
+                printer_copy["is_default"] = True
+                return printer_copy
+            return {
+                "name": default_name,
+                "type": "local",
+                "driver": "",
+                "port": "",
+                "status": "ready",
+                "status_code": 0,
+                "comment": "Default OS Printer",
+                "location": "",
+                "is_default": True,
+            }
+
+        # Fallback if no explicit default returned: pick first local printer if available
+        printers = self.list_local_printers()
+        if printers:
+            printer_copy = dict(printers[0])
+            printer_copy["is_default"] = True
+            return printer_copy
+        return None
+
     def list_local_printers(self) -> List[Dict]:
         """List printers installed in the OS (Windows via win32print, macOS/Linux via CUPS)."""
         if platform.system() == "Windows":
-            return self._list_win32_printers()
+            printers = self._list_win32_printers()
         elif platform.system() in ("Darwin", "Linux"):
-            return self._list_cups_printers()
-        return []
+            printers = self._list_cups_printers()
+        else:
+            printers = []
+
+        default_name = self.get_default_printer_name()
+        default_lower = default_name.lower() if default_name else None
+
+        for p in printers:
+            p["is_default"] = (p["name"].lower() == default_lower) if default_lower else False
+
+        return printers
 
     @staticmethod
     def _list_cups_printers() -> List[Dict]:

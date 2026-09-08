@@ -461,8 +461,10 @@ class ZebraBridgeApp(ctk.CTk):
         top_row.pack(fill="x", padx=12, pady=(10, 2))
 
         name = p.get("name", "Local Printer")
+        is_default = p.get("is_default", False)
+        display_name = f"{name} (Default)" if is_default else name
         ctk.CTkLabel(
-            top_row, text=name,
+            top_row, text=display_name,
             font=ctk.CTkFont(size=13, weight="bold"), text_color=TEXT_MAIN,
         ).pack(side="left")
 

@@ -208,10 +208,10 @@ class PrintServer:
                 "uptime": self._get_uptime(),
                 "required_fields": {
                     "json_print": [
-                        "printer_ip (IPv4 or 'test') OR printer_name (local OS printer)",
                         "raw_command (or legacy field 'zpl')",
+                        "printer_name (primary), default OS printer (fallback 1), or printer_ip (fallback 2)",
                     ],
-                    "raw_print": ["printer_ip (query, IPv4 or 'test')", "raw body"],
+                    "raw_print": ["printer_ip or printer_name (query, IPv4 or 'test')", "raw body"],
                 },
                 "endpoints": {
                     "print": "/print (POST JSON)",
@@ -275,42 +275,35 @@ class PrintServer:
             is_localhost = self._is_local_client(client_host)
 
             if not self._is_valid_target(target):
-                # Only auto-resolve as printer name for localhost requests
-                if is_localhost:
-                    self._record_usage(
-                        "connection_check_auto_resolve_as_name",
-                        original_target=target,
+                self._record_usage(
+                    "connection_check_auto_resolve_as_name",
+                    original_target=target,
+                )
+                try:
+                    result = self.on_connection_check(
+                        target=None,
+                        printer_name=target,
+                        is_localhost=is_localhost
                     )
-                    try:
-                        result = self.on_connection_check(
-                            target=None,
-                            printer_name=target,
-                            is_localhost=True
+                    if not result.get("success", False):
+                        raise HTTPException(
+                            status_code=503,
+                            detail=result.get("message", "Unable to reach printer"),
                         )
-                        if not result.get("success", False):
-                            raise HTTPException(
-                                status_code=503,
-                                detail=result.get("message", "Unable to reach printer"),
-                            )
-                        server_hostname = get_hostname()
-                        return ConnectionCheckResponse(
-                            success=result["success"],
-                            printer_ip=result.get("printer_ip", target),
-                            printer_type=result.get("printer_type", "local"),
-                            message=result.get("message", "Connection check completed"),
-                            latency_ms=result.get("latency_ms"),
-                            server_hostname=server_hostname,
-                            hostname=server_hostname,
-                        )
-                    except HTTPException:
-                        raise
-                    except Exception as e:
-                        raise HTTPException(status_code=500, detail=str(e))
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Valid printer_ip or printer_host query parameter is required for remote requests (IPv4, hostname, or 'test')",
+                    server_hostname = get_hostname()
+                    return ConnectionCheckResponse(
+                        success=result["success"],
+                        printer_ip=result.get("printer_ip", target),
+                        printer_type=result.get("printer_type", "local"),
+                        message=result.get("message", "Connection check completed"),
+                        latency_ms=result.get("latency_ms"),
+                        server_hostname=server_hostname,
+                        hostname=server_hostname,
                     )
+                except HTTPException:
+                    raise
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=str(e))
 
             try:
                 result = self.on_connection_check(target=target, printer_name=None, is_localhost=is_localhost)
@@ -366,35 +359,21 @@ class PrintServer:
             printer_ip = self._normalize_target(job.printer_ip or job.printer_host or "") or None
             raw_command = self._normalize_raw_command(job.raw_command or job.zpl or "")
 
-            if not printer_name and not printer_ip:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Either printer_ip (or printer_host) or printer_name is required",
-                )
-
             if not raw_command.strip():
                 raise HTTPException(status_code=400, detail="raw_command is required")
 
             client_host = request.client.host if request.client else None
             is_localhost = self._is_local_client(client_host)
 
-            # Auto-detect: if printer_ip is not a valid IP/hostname and request
-            # comes from localhost, treat it as a local printer name.
+            # Auto-detect: if printer_ip is not a valid network target, treat it as printer_name
             if printer_ip and not self._is_valid_target(printer_ip):
-                if is_localhost:
-                    self._record_usage(
-                        "json_print_auto_resolve_as_name",
-                        original_printer_ip=printer_ip,
-                    )
-                    # Move the non-network value to printer_name (keep printer_ip empty)
-                    if not printer_name:
-                        printer_name = printer_ip
-                    printer_ip = None
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid printer_ip. Use IPv4 address, hostname, or 'test'",
-                    )
+                self._record_usage(
+                    "json_print_auto_resolve_as_name",
+                    original_printer_ip=printer_ip,
+                )
+                if not printer_name:
+                    printer_name = printer_ip
+                printer_ip = None
 
             self._record_usage(
                 "json_print_requested",
@@ -421,7 +400,12 @@ class PrintServer:
                 )
                 if not result.get("success", False):
                     msg = result.get("message", "Print failed")
-                    status_code = 404 if "not found" in msg.lower() else 503
+                    if "not found" in msg.lower():
+                        status_code = 404
+                    elif "no printer target" in msg.lower() or "required" in msg.lower():
+                        status_code = 400
+                    else:
+                        status_code = 503
                     raise HTTPException(status_code=status_code, detail=msg)
                 server_hostname = get_hostname()
                 return PrintResponse(

@@ -310,19 +310,24 @@ curl -X POST http://192.168.1.100:5050/print \
   }'
 ```
 
+**Resolution & Fallback Hierarchy:**
+1. **Primary (`printer_name`)**: If provided, attempts to print to this OS-installed printer.
+2. **Fallback 1 (Default OS Printer)**: If `printer_name` is not found (or omitted), falls back to the system's default printer.
+3. **Fallback 2 (`printer_ip`)**: If neither local printer is available and `printer_ip` is specified, routes to the network printer via TCP/IP port 9100.
+
 **Parameters:**
 
 | Parameter      | Type   | Required | Description                                              |
 |----------------|--------|----------|----------------------------------------------------------|
-| `printer_ip`   | string | \*\*     | Printer IPv4 address, network hostname (e.g. `zebra-zd420.local`), or `"test"` (alias: `printer_host`) |
-| `printer_name` | string | \*\*     | Name of local/USB printer installed in OS                |
+| `printer_name` | string | No       | **Primary**: Name of local/USB printer installed in OS   |
+| `printer_ip`   | string | No       | **Fallback**: Printer IPv4 address, hostname, or `"test"` (alias: `printer_host`) |
 | `raw_command`  | string | Yes      | Raw ZPL command string (alias: `zpl` for legacy payload) |
 | `source`       | string | No       | Source label for tracking (default: `"Web API"`)         |
 | `id`           | string | No       | Custom job ID                                            |
 | `dpi`          | int    | No       | Printer resolution (informational only)                  |
 | `label_size`   | object | No       | Label dimensions `{width, height}` (informational)       |
 
-\*\* *Either `printer_ip` (or `printer_host`) or `printer_name` must be provided.*
+*\* If neither `printer_name` nor `printer_ip` is specified, the server automatically routes to the default OS printer.*
 
 **Response:**
 
