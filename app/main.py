@@ -26,6 +26,10 @@ from app.utils import (
     get_local_ip,
     get_hostname,
     is_valid_target,
+    is_valid_ipv4,
+    is_valid_mac,
+    normalize_mac,
+    get_mac_for_ip,
     normalize_target,
     normalize_raw_command,
     parse_target_address_port,
@@ -270,14 +274,14 @@ class PrintBridge:
                 raw_bytes=job["raw_length"],
             )
 
-            target = job.get("printer_ip")
+            target = job.get("printer_ip") or job.get("printer_mac")
             printer_name = job.get("printer_name")
             use_local = job.get("use_local", False)
             display_target = (printer_name if use_local else target) or printer_name or target
 
             if not target and not printer_name:
                 self.logger.error("Job [%s] rejected: Missing printer target.", job["id"])
-                self._mark_job_failed(job["id"], "printer_ip or printer_name is required")
+                self._mark_job_failed(job["id"], "printer_mac, printer_ip, or printer_name is required")
                 continue
 
             if use_local:
@@ -363,11 +367,13 @@ class PrintBridge:
         self._record_runtime_event("job_failed", job_id=job_id, error=error)
 
     def on_job_received(self, job_data: Dict) -> Dict:
-        """Handle incoming print job from the server with 3-tier printer resolution:
-        1. Primary: printer_name (if provided)
-        2. Fallback 1: Windows / OS Default Printer
-        3. Fallback 2: printer_ip / printer_host (network printer)
+        """Handle incoming print job from the server with multi-tier printer resolution:
+        1. Primary Network: printer_mac (Ethernet MAC address, dynamically resolved to current IP)
+        2. Secondary Network: printer_ip / printer_host (direct IPv4, hostname, or alias)
+        3. Local OS Printer: printer_name (if installed in OS spooler, or resolved network alias)
+        4. Fallback Local: OS Default Printer (only if no network target specified)
         """
+        printer_mac = normalize_target(job_data.get("printer_mac") or "")
         printer_ip = normalize_target(
             job_data.get("printer_ip") or job_data.get("printer_host") or ""
         )
@@ -383,8 +389,19 @@ class PrintBridge:
         if not raw_command.strip():
             return {"success": False, "message": "raw_command is required"}
 
+        # Auto-detect if printer_ip is actually a MAC address
+        if not printer_mac and is_valid_mac(printer_ip):
+            printer_mac = printer_ip
+            printer_ip = ""
+
+        if printer_mac:
+            printer_mac = normalize_mac(printer_mac) or printer_mac
+
         # Simulated test target check
-        is_test = printer_ip.lower() == "test" or printer_name.lower() == "test"
+        is_test = (
+            (printer_ip and printer_ip.lower() == "test")
+            or (printer_name and printer_name.lower() == "test")
+        )
 
         use_local = False
         resolved_local_name = None
@@ -396,13 +413,43 @@ class PrintBridge:
         else:
             # ─────────────────────────────────────────────────────────────
             # PRINTER RESOLUTION HIERARCHY:
-            # 1. Primary: Explicit printer_name
-            # 2. Fallback 1: Windows / OS Default Printer
-            # 3. Fallback 2: printer_ip (network printer)
+            # 1. Primary Network: printer_mac (resolves to current IP dynamically via ARP/cache)
+            # 2. Secondary Network: printer_ip / printer_host (direct IP, hostname, or alias)
+            # 3. Local OS Printer: printer_name (CUPS / Windows spooler)
+            #    (If not found locally, checks if printer_name is a network alias)
+            # 4. Fallback Local: OS Default Printer (ONLY if no network target was specified)
             # ─────────────────────────────────────────────────────────────
 
-            # 1. Primary: If printer_name is provided, search local OS printers
-            if printer_name:
+            # 1. Primary Network Target: printer_mac
+            if printer_mac:
+                resolved_mac_ip = self.printer_manager.resolve_network_address(printer_mac)
+                if is_valid_ipv4(resolved_mac_ip):
+                    printer_ip = resolved_mac_ip
+                    self.logger.info("Resolved MAC '%s' to active IP '%s'", printer_mac, printer_ip)
+                    self._record_runtime_event(
+                        "job_resolved_mac_to_ip",
+                        mac=printer_mac,
+                        resolved_ip=printer_ip,
+                        source=source,
+                    )
+                elif printer_ip:
+                    # MAC not resolved via ARP/cache; fall back to provided printer_ip
+                    self.logger.warning(
+                        "Could not resolve MAC '%s' via ARP; using provided printer_ip '%s'.",
+                        printer_mac, printer_ip
+                    )
+                else:
+                    # MAC target without separate IP — let network handler try scanning/resolving
+                    printer_ip = printer_mac
+
+            # 2. Network Target: printer_ip / alias resolution
+            if printer_ip:
+                resolved_net = self.printer_manager.resolve_network_address(printer_ip)
+                if resolved_net:
+                    printer_ip = resolved_net
+
+            # 3. If no network target (no MAC, no IP), check printer_name
+            if not printer_mac and not printer_ip and printer_name:
                 local = self.printer_manager.find_local_printer(printer_name)
                 if local:
                     use_local = True
@@ -413,19 +460,19 @@ class PrintBridge:
                         source=source,
                     )
                 else:
-                    self.logger.warning(
-                        "Printer '%s' not found locally. Attempting fallback to default OS printer.",
-                        printer_name,
-                    )
-                    self._record_runtime_event(
-                        "job_fallback_default_printer_attempted",
-                        requested_printer=printer_name,
-                        source=source,
-                    )
+                    # Check if printer_name is actually a known network printer or alias
+                    net_resolved = self.printer_manager.resolve_network_address(printer_name)
+                    if net_resolved and (is_valid_ipv4(net_resolved) or is_valid_mac(net_resolved)):
+                        printer_ip = net_resolved
+                        self.logger.info("Resolved printer_name '%s' to network address '%s'", printer_name, printer_ip)
+                    else:
+                        self.logger.warning(
+                            "Printer '%s' not found locally or as network alias. Attempting fallback to default OS printer.",
+                            printer_name,
+                        )
 
-            # 2. Fallback 1: If not resolved locally and either printer_name was not found
-            #    or no specific printer_name was given (and no exclusive printer_ip specified)
-            if not use_local and not (printer_ip and not printer_name):
+            # 4. Fallback: OS Default Printer ONLY if no network target was targeted
+            if not use_local and not printer_mac and not printer_ip:
                 default_local = self.printer_manager.get_default_local_printer()
                 if default_local:
                     use_local = True
@@ -437,7 +484,7 @@ class PrintBridge:
                         )
                     else:
                         self.logger.info(
-                            "No printer_name specified; using default OS printer '%s'.",
+                            "No printer target specified; using default OS printer '%s'.",
                             resolved_local_name,
                         )
                     self._record_runtime_event(
@@ -447,45 +494,42 @@ class PrintBridge:
                         source=source,
                     )
 
-            # 3. Fallback 2: If local resolution failed or printer_ip was targeted
+            # 5. Network validation if targeting network
             if not use_local:
-                if printer_ip:
-                    # Validate network target
-                    connection_result = self.check_connection(target=printer_ip, is_localhost=is_localhost)
+                net_target = printer_ip or printer_mac
+                if net_target:
+                    connection_result = self.check_connection(target=net_target, is_localhost=is_localhost)
                     if not connection_result.get("success", False):
                         message = connection_result.get("message", "Cannot connect to printer")
                         self._record_runtime_event(
                             "job_rejected_unreachable_printer",
                             printer_ip=printer_ip,
+                            printer_mac=printer_mac,
                             source=source,
                             error=message,
                         )
                         return {"success": False, "message": message}
-                    if printer_name:
-                        self.logger.info(
-                            "Printer '%s' and default OS printer not available; fell back to network printer '%s'.",
-                            printer_name, printer_ip,
-                        )
                 else:
                     if printer_name:
                         return {
                             "success": False,
-                            "message": f"Printer '{printer_name}' not found locally, no default OS printer available, and no printer_ip provided.",
+                            "message": f"Printer '{printer_name}' not found locally, no network target, and no default OS printer available.",
                         }
                     return {
                         "success": False,
-                        "message": "No printer target found. Specify printer_name, configure a default OS printer, or provide printer_ip.",
+                        "message": "No printer target found. Specify printer_mac, printer_ip, or printer_name.",
                     }
 
         if use_local and resolved_local_name:
             printer_name = resolved_local_name
 
-        display_target = (printer_name if use_local else printer_ip) or printer_name or printer_ip
+        display_target = (printer_name if use_local else (printer_mac or printer_ip)) or printer_name or printer_ip
 
         job = {
             "id": job_id,
             "source": source,
             "printer_ip": printer_ip or None,
+            "printer_mac": printer_mac or None,
             "printer_name": printer_name or None,
             "use_local": use_local,
             "raw_command": raw_command,
@@ -506,6 +550,7 @@ class PrintBridge:
             job_id=job["id"],
             source=job["source"],
             printer_ip=job.get("printer_ip"),
+            printer_mac=job.get("printer_mac"),
             printer_name=job.get("printer_name"),
             raw_bytes=job["raw_length"],
             queue_size=self.print_queue.qsize(),
@@ -603,26 +648,35 @@ class PrintBridge:
                 }
 
         # Network printer path
-        printer_ip = normalize_target(target or "")
+        target_net = normalize_target(target or "")
 
-        self._record_runtime_event("connection_check_requested", printer_ip=printer_ip)
+        self._record_runtime_event("connection_check_requested", printer_ip=target_net)
 
-        if not printer_ip:
+        if not target_net:
             return {
                 "success": False,
                 "printer_ip": "",
+                "printer_mac": None,
                 "printer_type": "unknown",
-                "message": "printer_ip is required",
+                "message": "printer_ip or printer_mac is required",
                 "latency_ms": 0.0,
             }
 
-        printer = self._build_printer_target(printer_ip)
+        printer = self._build_printer_target(target_net)
         success, message = self.printer_manager.test_connection(printer)
         latency_ms = round((perf_counter() - started_at) * 1000, 2)
 
+        resolved_ip = printer.get("address", target_net)
+        found_mac = None
+        if is_valid_mac(target_net):
+            found_mac = normalize_mac(target_net)
+        elif is_valid_ipv4(resolved_ip):
+            found_mac = get_mac_for_ip(resolved_ip) or None
+
         self._record_runtime_event(
             "connection_check_completed",
-            printer_ip=printer_ip,
+            printer_ip=resolved_ip,
+            printer_mac=found_mac,
             printer_type=printer.get("type"),
             success=success,
             latency_ms=latency_ms,
@@ -630,7 +684,8 @@ class PrintBridge:
 
         return {
             "success": success,
-            "printer_ip": printer_ip,
+            "printer_ip": resolved_ip,
+            "printer_mac": found_mac,
             "printer_type": printer.get("type", "unknown"),
             "message": message,
             "latency_ms": latency_ms,

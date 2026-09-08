@@ -309,11 +309,11 @@
             />
           </div>
           <div class="form-group">
-            <label for="printerIp">Printer IP / Hostname</label>
+            <label for="printerIp">Printer MAC / IP / Hostname</label>
             <input
               type="text"
               id="printerIp"
-              placeholder="192.168.1.100, zebra-printer.local, or test"
+              placeholder="e.g. 00:07:4D:6F:C2:14, 192.168.1.150, or NH-LSHIP1"
             />
           </div>
           <div class="form-group">
@@ -489,9 +489,21 @@
         );
       }
 
+      function isValidMac(mac) {
+        if (!mac) return false;
+        const clean = mac.trim().toLowerCase();
+        if (/^([0-9a-f]{2}[:-]){5}([0-9a-f]{2})$/i.test(clean)) return true;
+        if (/^([0-9a-f]{4}\.){2}([0-9a-f]{4})$/i.test(clean)) return true;
+        if (/^[0-9a-f]{12}$/i.test(clean)) return true;
+        return false;
+      }
+
       function isValidTarget(value) {
         const target = (value || "").trim().toLowerCase();
         if (target === "test") {
+          return true;
+        }
+        if (isValidMac(target)) {
           return true;
         }
         let host = (value || "").trim();
@@ -504,7 +516,7 @@
             }
           }
         }
-        return isValidIpv4(host) || isValidHostname(host);
+        return isValidIpv4(host) || isValidHostname(host) || isValidMac(host);
       }
 
       function getPrinterName() {
@@ -529,18 +541,18 @@
         const rawCommand = getRawCommand();
 
         if (!printerName && !printerIp) {
-          log("Printer Name or Printer IP / Hostname is required", true);
+          log("Printer Name or Printer MAC / IP / Hostname is required", true);
           return false;
         }
 
         if (printerName && printerIp) {
-          log("Please provide EITHER Printer Name OR Printer IP / Hostname, not both.", true);
+          log("Please provide EITHER Printer Name OR Printer MAC / IP / Hostname, not both.", true);
           return false;
         }
 
-        // If IP / hostname is provided, validate it
+        // If MAC / IP / hostname is provided, validate it
         if (printerIp && !isValidTarget(printerIp)) {
-          log("Invalid Printer IP / Hostname. Use IPv4, hostname, or 'test'", true);
+          log("Invalid Printer MAC / IP / Hostname. Use MAC address, IPv4, hostname, or 'test'", true);
           return false;
         }
 
@@ -622,7 +634,13 @@
             source,
           };
           if (printerName) payload.printer_name = printerName;
-          if (printerIp) payload.printer_ip = printerIp;
+          if (printerIp) {
+            if (isValidMac(printerIp)) {
+              payload.printer_mac = printerIp;
+            } else {
+              payload.printer_ip = printerIp;
+            }
+          }
 
           const response = await fetch(`${getServerUrl()}/print`, {
             method: "POST",
@@ -654,7 +672,7 @@
         const printerIp = getPrinterIp();
 
         if (!printerName && !printerIp) {
-          log("Printer Name or Printer IP is required", true);
+          log("Printer Name or Printer MAC / IP is required", true);
           return;
         }
 
@@ -668,15 +686,22 @@
 
           const params = new URLSearchParams();
           if (printerName) params.set("printer_name", printerName);
-          if (printerIp) params.set("printer_ip", printerIp);
+          if (printerIp) {
+            if (isValidMac(printerIp)) {
+              params.set("printer_mac", printerIp);
+            } else {
+              params.set("printer_ip", printerIp);
+            }
+          }
 
           const url = `${getServerUrl()}/connection?${params.toString()}`;
           const response = await fetch(url);
           const data = await response.json();
 
           if (response.ok && data.success) {
+            const targetInfo = data.printer_mac ? `${data.printer_mac} (${data.printer_ip})` : data.printer_ip;
             log(
-              `Printer connection OK: ${data.printer_type} ${data.printer_ip} (${data.latency_ms} ms) - ${data.message}`,
+              `Printer connection OK: ${data.printer_type} ${targetInfo} (${data.latency_ms} ms) - ${data.message}`,
             );
           } else {
             log(
@@ -708,7 +733,8 @@
         try {
           localStorage.setItem("zebra_bridge_printer_ip", printerIp);
 
-          const url = `${getServerUrl()}/print/raw?printer_ip=${encodeURIComponent(printerIp)}&source=${encodeURIComponent(source)}`;
+          const targetParam = isValidMac(printerIp) ? "printer_mac" : "printer_ip";
+          const url = `${getServerUrl()}/print/raw?${targetParam}=${encodeURIComponent(printerIp)}&source=${encodeURIComponent(source)}`;
           const response = await fetch(url, {
             method: "POST",
             headers: {

@@ -420,6 +420,13 @@ class ZebraBridgeApp(ctk.CTk):
         hostname = p.get("hostname") or "—"
         ip = p.get("address") or p.get("ip") or ""
         port = p.get("port", 9100)
+        mac = p.get("mac_address") or "—"
+
+        if mac and mac != "—":
+            ctk.CTkLabel(
+                info_frame, text=f"MAC:  {mac}",
+                font=ctk.CTkFont(family="Consolas", size=12, weight="bold"), text_color=TEXT_MAIN,
+            ).pack(anchor="w")
 
         ctk.CTkLabel(
             info_frame, text=f"Hostname:  {hostname}",
@@ -428,12 +435,22 @@ class ZebraBridgeApp(ctk.CTk):
 
         ctk.CTkLabel(
             info_frame, text=f"IP:  {ip}:{port}",
-            font=ctk.CTkFont(family="Consolas", size=12, weight="bold"), text_color=TEXT_MAIN,
+            font=ctk.CTkFont(family="Consolas", size=12), text_color=TEXT_MAIN,
         ).pack(anchor="w", pady=(1, 6))
 
         # Action buttons
         btn_row = ctk.CTkFrame(card, fg_color="transparent")
         btn_row.pack(fill="x", padx=12, pady=(0, 10))
+
+        if mac and mac != "—":
+            copy_mac_btn = ctk.CTkButton(
+                btn_row, text="📋 Copy MAC", width=100, height=26,
+                font=ctk.CTkFont(size=11),
+                fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
+                corner_radius=6,
+            )
+            copy_mac_btn.configure(command=lambda m=mac, b=copy_mac_btn: self._copy_to_clipboard(m, b, "📋 Copy MAC"))
+            copy_mac_btn.pack(side="left", padx=(0, 6))
 
         copy_btn = ctk.CTkButton(
             btn_row, text="📋 Copy IP", width=95, height=26,
@@ -441,7 +458,7 @@ class ZebraBridgeApp(ctk.CTk):
             fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
             corner_radius=6,
         )
-        copy_btn.configure(command=lambda: self._copy_to_clipboard(ip, copy_btn, "📋 Copy IP"))
+        copy_btn.configure(command=lambda i=ip, b=copy_btn: self._copy_to_clipboard(i, b, "📋 Copy IP"))
         copy_btn.pack(side="left", padx=(0, 6))
 
         test_btn = ctk.CTkButton(

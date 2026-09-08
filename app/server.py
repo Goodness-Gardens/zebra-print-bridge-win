@@ -24,6 +24,8 @@ from .utils import (
     is_valid_target,
     normalize_target,
     normalize_raw_command,
+    is_valid_mac,
+    normalize_mac,
 )
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 class PrintJob(BaseModel):
     """Model for JSON print job requests (supports legacy and new payloads)."""
 
+    printer_mac: Optional[str] = None  # Ethernet MAC address (resolves dynamically to current IP)
     printer_ip: Optional[str] = None
     printer_host: Optional[str] = None  # Network hostname or IP alias
     printer_name: Optional[str] = None  # Local/USB printer name installed in the OS
@@ -58,6 +61,7 @@ class ConnectionCheckResponse(BaseModel):
 
     success: bool
     printer_ip: str
+    printer_mac: Optional[str] = None
     printer_type: str
     message: str
     latency_ms: Optional[float] = None
@@ -209,15 +213,22 @@ class PrintServer:
                 "required_fields": {
                     "json_print": [
                         "raw_command (or legacy field 'zpl')",
-                        "printer_name (primary), default OS printer (fallback 1), or printer_ip (fallback 2)",
+                        "printer_mac (Ethernet MAC address, resolves dynamically to current IP, immune to DHCP IP changes)",
+                        "printer_name (local OS printer), default OS printer (fallback 1), or printer_ip / printer_host (fallback 2)",
                     ],
-                    "raw_print": ["printer_ip or printer_name (query, IPv4 or 'test')", "raw body"],
+                    "raw_print": ["printer_mac, printer_ip or printer_name (query, MAC, IPv4, hostname, or 'test')", "raw body"],
+                },
+                "supported_targets": {
+                    "printer_mac": "Ethernet MAC address (e.g. '00:07:4D:6F:C2:14', '00-07-4D-6F-C2-14', '00074d6fc214') - dynamic ARP/cache IP resolution",
+                    "printer_ip": "Direct IPv4 address (e.g. '192.168.1.150') or simulated 'test'",
+                    "printer_host": "Network DNS hostname or alias (e.g. 'NH-LSHIP1')",
+                    "printer_name": "Local OS printer installed in spooler",
                 },
                 "endpoints": {
-                    "print": "/print (POST JSON)",
-                    "print_raw": "/print/raw (POST plain text)",
-                    "printers": "/printers (GET) — list OS-installed printers",
-                    "connection": "/connection?printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
+                    "print": "/print (POST JSON, supports printer_mac, printer_ip, printer_host, printer_name)",
+                    "print_raw": "/print/raw?printer_mac=<MAC>&printer_ip=<IP>&printer_name=<name> (POST plain text)",
+                    "printers": "/printers (GET) — list discovered network printers (with MAC addresses) and OS-installed printers",
+                    "connection": "/connection?printer_mac=<MAC>&printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
                     "status": "/status (GET)",
                     "health": "/health (GET)",
                     "info": "/info (GET)",
@@ -230,6 +241,8 @@ class PrintServer:
         @app.get("/connection", response_model=ConnectionCheckResponse)
         async def check_connection(
             request: Request,
+            printer_mac: Optional[str] = None,
+            mac: Optional[str] = None,
             printer_ip: str = "",
             ip: Optional[str] = None,
             printer_host: Optional[str] = None,
@@ -242,8 +255,8 @@ class PrintServer:
                     status_code=500, detail="Connection check handler not configured"
                 )
 
-            # If printer_name is provided, delegate to the callback directly
-            if printer_name and printer_name.strip():
+            # If printer_name is provided alone, delegate to the callback directly
+            if printer_name and printer_name.strip() and not (printer_mac or mac or printer_ip or ip):
                 self._record_usage("connection_check_requested", printer_name=printer_name.strip())
                 try:
                     result = self.on_connection_check(
@@ -268,7 +281,7 @@ class PrintServer:
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=str(e))
 
-            target = self._normalize_target(printer_ip or ip or printer_host or host or "")
+            target = self._normalize_target(printer_mac or mac or printer_ip or ip or printer_host or host or "")
             self._record_usage("connection_check_requested", printer_ip=target)
 
             client_host = request.client.host if request.client else None
@@ -330,6 +343,7 @@ class PrintServer:
                 return ConnectionCheckResponse(
                     success=result.get("success", False),
                     printer_ip=result.get("printer_ip", target),
+                    printer_mac=result.get("printer_mac"),
                     printer_type=result.get("printer_type", "unknown"),
                     message=result.get("message", "Connection check completed"),
                     latency_ms=result.get("latency_ms"),
@@ -356,7 +370,18 @@ class PrintServer:
                 raise HTTPException(status_code=500, detail="Print handler not configured")
 
             printer_name = (job.printer_name or "").strip() or None
-            printer_ip = self._normalize_target(job.printer_ip or job.printer_host or "") or None
+            printer_mac = (job.printer_mac or "").strip() or None
+            raw_ip = (job.printer_ip or job.printer_host or "").strip()
+
+            # Auto-detect MAC if provided in printer_ip
+            if not printer_mac and raw_ip and is_valid_mac(raw_ip):
+                printer_mac = raw_ip
+                raw_ip = ""
+
+            printer_ip = self._normalize_target(raw_ip) or None
+            if printer_mac:
+                printer_mac = normalize_mac(printer_mac) or printer_mac
+
             raw_command = self._normalize_raw_command(job.raw_command or job.zpl or "")
 
             if not raw_command.strip():
@@ -379,6 +404,7 @@ class PrintServer:
                 "json_print_requested",
                 printer_name=printer_name,
                 printer_ip=printer_ip,
+                printer_mac=printer_mac,
                 source=job.source,
                 request_id=job.id,
                 raw_bytes=len(raw_command),
@@ -389,6 +415,7 @@ class PrintServer:
                 result = self.on_job_received(
                     {
                         "printer_name": printer_name,
+                        "printer_mac": printer_mac,
                         "printer_ip": printer_ip,
                         "raw_command": raw_command,
                         "dpi": job.dpi,
@@ -423,7 +450,7 @@ class PrintServer:
 
         @app.post("/print/raw")
         async def print_raw(request: Request):
-            """Send raw command from plain text body with printer IP in query params."""
+            """Send raw command from plain text body with printer IP, MAC, or name in query params."""
             if not self.on_job_received:
                 raise HTTPException(status_code=500, detail="Print handler not configured")
 
@@ -433,13 +460,32 @@ class PrintServer:
                 self._record_usage("raw_print_rejected_empty_payload")
                 raise HTTPException(status_code=400, detail="Empty raw command")
 
+            printer_mac = self._normalize_target(
+                request.query_params.get("printer_mac")
+                or request.query_params.get("mac")
+                or ""
+            ) or None
             printer_ip = self._normalize_target(
                 request.query_params.get("printer_ip")
                 or request.query_params.get("printer_host")
                 or request.query_params.get("ip")
                 or request.query_params.get("host")
                 or ""
-            )
+            ) or None
+            printer_name = (
+                request.query_params.get("printer_name")
+                or request.query_params.get("name")
+                or ""
+            ).strip() or None
+
+            # Auto-detect MAC if provided in printer_ip
+            if not printer_mac and printer_ip and is_valid_mac(printer_ip):
+                printer_mac = printer_ip
+                printer_ip = None
+
+            if printer_mac:
+                printer_mac = normalize_mac(printer_mac) or printer_mac
+
             source = request.query_params.get("source", "Raw API")
             request_id = request.query_params.get("id")
 
@@ -448,59 +494,20 @@ class PrintServer:
 
             self._record_usage(
                 "raw_print_requested",
+                printer_name=printer_name,
                 printer_ip=printer_ip,
+                printer_mac=printer_mac,
                 source=source,
                 request_id=request_id,
                 raw_bytes=len(raw_command),
                 is_localhost=is_localhost
             )
 
-            if not self._is_valid_target(printer_ip):
-                # Only auto-resolve as printer name for localhost requests
-                if is_localhost:
-                    self._record_usage(
-                        "raw_print_auto_resolve_as_name",
-                        original_printer_ip=printer_ip,
-                    )
-                    try:
-                        result = self.on_job_received(
-                            {
-                                "printer_name": printer_ip,
-                                "raw_command": raw_command,
-                                "source": source,
-                                "id": request_id,
-                                "is_localhost": True,
-                            }
-                        )
-                        if not result.get("success", False):
-                            status_code = 404 if "not found" in result.get("message", "").lower() else 503
-                            raise HTTPException(
-                                status_code=status_code,
-                                detail=result.get("message", "Print failed"),
-                            )
-                        server_hostname = get_hostname()
-                        return {
-                            "success": result.get("success", False),
-                            "job_id": result.get("job_id"),
-                            "message": result.get("message", "Job queued successfully"),
-                            "server_hostname": server_hostname,
-                            "hostname": server_hostname,
-                        }
-                    except HTTPException:
-                        raise
-                    except Exception as e:
-                        self._record_usage("raw_print_failed", printer_name=printer_ip, error=type(e).__name__)
-                        logger.error("Error processing raw print job: %s", e)
-                        raise HTTPException(status_code=500, detail=str(e))
-                else:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Invalid printer_ip. Use IPv4 address, hostname, or 'test'",
-                    )
-
             try:
                 result = self.on_job_received(
                     {
+                        "printer_name": printer_name,
+                        "printer_mac": printer_mac,
                         "printer_ip": printer_ip,
                         "raw_command": raw_command,
                         "source": source,
@@ -511,16 +518,21 @@ class PrintServer:
                 if not result.get("success", False):
                     self._record_usage(
                         "raw_print_rejected_unreachable_target",
+                        printer_name=printer_name,
                         printer_ip=printer_ip,
+                        printer_mac=printer_mac,
                         message=result.get("message"),
                     )
+                    status_code = 404 if "not found" in result.get("message", "").lower() else 503
                     raise HTTPException(
-                        status_code=503,
-                        detail=result.get("message", "Unable to reach printer"),
+                        status_code=status_code,
+                        detail=result.get("message", "Print failed"),
                     )
                 self._record_usage(
                     "raw_print_enqueued",
+                    printer_name=printer_name,
                     printer_ip=printer_ip,
+                    printer_mac=printer_mac,
                     success=result.get("success", False),
                     job_id=result.get("job_id"),
                 )
@@ -535,7 +547,7 @@ class PrintServer:
             except HTTPException:
                 raise
             except Exception as e:
-                self._record_usage("raw_print_failed", printer_ip=printer_ip, error=type(e).__name__)
+                self._record_usage("raw_print_failed", printer_name=printer_name, printer_ip=printer_ip, printer_mac=printer_mac, error=type(e).__name__)
                 logger.error("Error processing raw print job: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))
 

@@ -20,7 +20,14 @@ import time
 from typing import List, Dict, Tuple, Optional
 import urllib.request
 
-from .utils import get_local_ip, is_valid_ipv4
+from .utils import (
+    get_local_ip,
+    is_valid_ipv4,
+    is_valid_mac,
+    normalize_mac,
+    get_mac_for_ip,
+    get_ip_for_mac,
+)
 
 # Conditional import for Windows printing
 _win32print = None
@@ -33,11 +40,57 @@ if platform.system() == "Windows":
 logger = logging.getLogger(__name__)
 
 
+def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> str:
+    """Query an SNMPv1/v2c OID on UDP port 161 (100% passive to port 9100, zero print bytes)."""
+    try:
+        oid_bytes = bytearray([oid_list[0] * 40 + oid_list[1]])
+        for val in oid_list[2:]:
+            if val < 128:
+                oid_bytes.append(val)
+            else:
+                parts = []
+                while val > 0:
+                    parts.append(val & 0x7F)
+                    val >>= 7
+                for i in range(len(parts) - 1, 0, -1):
+                    oid_bytes.append(parts[i] | 0x80)
+                oid_bytes.append(parts[0])
+
+        comm_bytes = b"public"
+        varbind = b"\x30" + bytes([len(oid_bytes) + 4]) + b"\x06" + bytes([len(oid_bytes)]) + bytes(oid_bytes) + b"\x05\x00"
+        varbind_list = b"\x30" + bytes([len(varbind)]) + varbind
+        pdu_payload = b"\x02\x01\x01\x02\x01\x00\x02\x01\x00" + varbind_list
+        pdu = b"\xa0" + bytes([len(pdu_payload)]) + pdu_payload
+        msg_payload = b"\x02\x01\x00\x04" + bytes([len(comm_bytes)]) + comm_bytes + pdu
+        pkt = b"\x30" + bytes([len(msg_payload)]) + msg_payload
+
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.settimeout(timeout)
+        try:
+            s.sendto(pkt, (ip, 161))
+            data, _ = s.recvfrom(2048)
+            pdu_idx = data.find(b"\xa2")
+            if pdu_idx != -1:
+                oid_idx = data.find(b"\x06", pdu_idx)
+                if oid_idx != -1:
+                    oid_len = data[oid_idx + 1]
+                    val_idx = oid_idx + 2 + oid_len
+                    if val_idx < len(data) and data[val_idx] == 0x04:
+                        val_len = data[val_idx + 1]
+                        return data[val_idx + 2 : val_idx + 2 + val_len].decode("utf-8", errors="ignore").strip()
+        finally:
+            s.close()
+    except Exception:
+        pass
+    return ""
+
+
 def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     """
     Probe a network IP for printer availability without sending any print payload.
     - Uses passive TCP connect on port 9100 (WITHOUT sending any bytes) to test if the port is open.
-    - Uses reverse DNS and HTTP port 80 title check to discover the printer's friendly name/model and hostname.
+    - Resolves MAC address via ARP cache.
+    - Uses reverse DNS, HTTP title, and SNMP MIB queries to discover friendly name and serial number.
     - NEVER sends commands to port 9100, ensuring printers NEVER print spurious test labels.
     """
     friendly_name = ""
@@ -87,12 +140,34 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     except Exception:
         pass
 
+    # 4. Resolve MAC address via OS ARP table (instant, safe)
+    mac_address = get_mac_for_ip(ip)
+
+    # 5. Fallback to SNMP sysName / Zebra Enterprise MIB on UDP port 161
+    unique_id = ""
+    if not friendly_name:
+        # Zebra enterprise friendly name: 1.3.6.1.4.1.10642.1.4.0
+        snmp_name = _query_snmp_string(ip, [1, 3, 6, 1, 4, 1, 10642, 1, 4, 0], timeout=0.3)
+        if snmp_name:
+            friendly_name = snmp_name
+        else:
+            # Standard MIB-2 sysName.0: 1.3.6.1.2.1.1.5.0
+            snmp_sys = _query_snmp_string(ip, [1, 3, 6, 1, 2, 1, 1, 5, 0], timeout=0.3)
+            if snmp_sys:
+                friendly_name = snmp_sys
+
+    # Serial number via Zebra Enterprise MIB: 1.3.6.1.4.1.10642.1.9.0
+    snmp_serial = _query_snmp_string(ip, [1, 3, 6, 1, 4, 1, 10642, 1, 9, 0], timeout=0.3)
+    if snmp_serial:
+        unique_id = snmp_serial
+
     return {
         "name": friendly_name or (hostname.split(".")[0] if hostname else f"Zebra Printer ({ip})"),
         "hostname": hostname,
         "ip": ip,
         "port": 9100,
-        "unique_id": "",
+        "unique_id": unique_id,
+        "mac_address": mac_address,
         "last_seen": datetime.now().isoformat(),
     }
 
@@ -264,6 +339,13 @@ class PrinterManager:
                     mapping[clean_host] = ip
             if uid:
                 mapping[uid.lower()] = ip
+            mac = p.get("mac_address", "").strip()
+            if mac:
+                norm_mac = normalize_mac(mac)
+                if norm_mac:
+                    mapping[norm_mac.lower()] = ip
+                    mapping[norm_mac.lower().replace(":", "")] = ip
+                    mapping[norm_mac.lower().replace(":", "-")] = ip
 
         # 2. User-defined saved_printers from config
         for p in self.saved_printers:
@@ -402,6 +484,33 @@ class PrinterManager:
         clean_addr = address.strip()
         if is_valid_ipv4(clean_addr):
             return clean_addr
+
+        # Special handling for MAC address targeting (e.g. '00:07:4D:6F:C2:14' or '00074d6fc214')
+        if is_valid_mac(clean_addr):
+            norm_mac = normalize_mac(clean_addr)
+            if norm_mac:
+                # 1. Check in-memory alias map
+                with self._lock:
+                    if norm_mac.lower() in self._alias_map:
+                        resolved = self._alias_map[norm_mac.lower()]
+                        logger.info("Resolved printer MAC '%s' -> %s (dynamic cache)", norm_mac, resolved)
+                        return resolved
+
+                # 2. Check OS ARP table directly (instant, safe)
+                arp_ip = get_ip_for_mac(norm_mac)
+                if arp_ip:
+                    logger.info("Resolved printer MAC '%s' -> %s (OS ARP table)", norm_mac, arp_ip)
+                    return arp_ip
+
+                # 3. Refresh known printers if scan_network is enabled
+                if self.scan_network:
+                    self.refresh_known_printers()
+                    arp_ip = get_ip_for_mac(norm_mac)
+                    if arp_ip:
+                        return arp_ip
+                    with self._lock:
+                        if norm_mac.lower() in self._alias_map:
+                            return self._alias_map[norm_mac.lower()]
 
         clean_lower = clean_addr.lower()
 
@@ -629,6 +738,7 @@ class PrinterManager:
                     "port": p.get("port", self.DEFAULT_PORT),
                     "status": "ready",
                     "unique_id": p.get("unique_id", ""),
+                    "mac_address": p.get("mac_address", ""),
                 })
             # Sort by name
             printers.sort(key=lambda x: x["name"])
