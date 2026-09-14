@@ -78,6 +78,8 @@ class PrintServer:
         on_connection_check: Callable = None,
         on_logs_clear: Callable = None,
         on_list_printers: Callable = None,
+        on_refresh_printers: Callable = None,
+        on_clear_printer_cache: Callable = None,
     ):
         self.port = port
         self.on_job_received = on_job_received
@@ -85,6 +87,8 @@ class PrintServer:
         self.on_connection_check = on_connection_check
         self.on_logs_clear = on_logs_clear
         self.on_list_printers = on_list_printers
+        self.on_refresh_printers = on_refresh_printers
+        self.on_clear_printer_cache = on_clear_printer_cache
         self.is_running = False
         self.start_time = None
         self.resource_dir = Path(__file__).resolve().parent.parent / "resources"
@@ -227,7 +231,9 @@ class PrintServer:
                 "endpoints": {
                     "print": "/print (POST JSON, supports printer_mac, printer_ip, printer_host, printer_name)",
                     "print_raw": "/print/raw?printer_mac=<MAC>&printer_ip=<IP>&printer_name=<name> (POST plain text)",
-                    "printers": "/printers (GET) — list discovered network printers (with MAC addresses) and OS-installed printers",
+                    "printers": "/printers (GET, accepts ?refresh=true) — list discovered network printers and OS-installed printers",
+                    "printers_refresh": "/printers/refresh (POST) — clear cache and re-scan network printers",
+                    "printers_clear": "/printers/clear (POST) — clear printer cache",
                     "connection": "/connection?printer_mac=<MAC>&printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
                     "status": "/status (GET)",
                     "health": "/health (GET)",
@@ -598,19 +604,53 @@ class PrintServer:
             }
 
         @app.get("/printers")
-        async def list_printers():
-            """List both network and local OS-installed printers."""
-            self._record_usage("printers_list_requested")
-            if not self.on_list_printers:
-                raise HTTPException(
-                    status_code=500, detail="Printer listing handler not configured"
-                )
+        async def list_printers(refresh: bool = False):
+            """List both network and local OS-installed printers. Pass ?refresh=true to clear cache and re-scan."""
+            if refresh and self.on_refresh_printers:
+                self._record_usage("printers_refresh_requested")
+                try:
+                    printers = self.on_refresh_printers(clear_cache=True)
+                except Exception as e:
+                    logger.error("Error refreshing printers: %s", e)
+                    raise HTTPException(status_code=500, detail=str(e))
+            else:
+                self._record_usage("printers_list_requested")
+                if not self.on_list_printers:
+                    raise HTTPException(
+                        status_code=500, detail="Printer listing handler not configured"
+                    )
+                try:
+                    printers = self.on_list_printers()
+                except Exception as e:
+                    logger.error("Error listing printers: %s", e)
+                    raise HTTPException(status_code=500, detail=str(e))
+
+            server_hostname = get_hostname()
+            network_printers = [p for p in printers if p.get("type") == "network"]
+            local_printers = [p for p in printers if p.get("type") == "local"]
+            return {
+                "server_hostname": server_hostname,
+                "hostname": server_hostname,
+                "count": len(printers),
+                "printers": printers,
+                "network_printers": network_printers,
+                "local_printers": local_printers,
+            }
+
+        @app.post("/printers/refresh")
+        async def refresh_printers_endpoint():
+            """Clear printer cache, re-scan local network, and return fresh printer list."""
+            self._record_usage("printers_refresh_requested")
+            if not self.on_refresh_printers:
+                raise HTTPException(status_code=500, detail="Refresh handler not configured")
             try:
-                printers = self.on_list_printers()
+                printers = self.on_refresh_printers(clear_cache=True)
                 server_hostname = get_hostname()
                 network_printers = [p for p in printers if p.get("type") == "network"]
                 local_printers = [p for p in printers if p.get("type") == "local"]
                 return {
+                    "success": True,
+                    "message": "Printer cache cleared and network re-scanned",
                     "server_hostname": server_hostname,
                     "hostname": server_hostname,
                     "count": len(printers),
@@ -619,7 +659,20 @@ class PrintServer:
                     "local_printers": local_printers,
                 }
             except Exception as e:
-                logger.error("Error listing printers: %s", e)
+                logger.error("Error refreshing printers: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/printers/clear")
+        async def clear_printers_cache_endpoint():
+            """Clear the persistent printer cache."""
+            self._record_usage("printers_clear_requested")
+            if not self.on_clear_printer_cache:
+                raise HTTPException(status_code=500, detail="Clear cache handler not configured")
+            try:
+                result = self.on_clear_printer_cache()
+                return result
+            except Exception as e:
+                logger.error("Error clearing printer cache: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))
 
         return app

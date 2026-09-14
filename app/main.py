@@ -73,6 +73,7 @@ class PrintBridge:
             network_timeout=self.config.network_timeout,
             saved_printers=self.config.saved_printers,
             printer_aliases=self.config.get("printer_aliases", {}),
+            custom_subnets=self.config.custom_subnets,
         )
 
         self.print_queue = queue.Queue()
@@ -156,6 +157,8 @@ class PrintBridge:
             on_connection_check=self.check_connection,
             on_logs_clear=self.clear_logs_state,
             on_list_printers=self.list_printers,
+            on_refresh_printers=self.refresh_printers,
+            on_clear_printer_cache=self.clear_printer_cache,
         )
 
         self.running = True
@@ -702,6 +705,18 @@ class PrintBridge:
     def list_printers(self) -> List[Dict]:
         """List both dynamically discovered network Zebra printers and local/USB printers."""
         return self.list_network_printers() + self.list_local_printers()
+
+    def refresh_printers(self, clear_cache: bool = True) -> List[Dict]:
+        """Clear cache and scan current subnet for fresh printers."""
+        self._record_runtime_event("printers_refresh_requested", clear_cache=clear_cache)
+        self.printer_manager.scan_subnet(clear_cache=clear_cache)
+        return self.list_printers()
+
+    def clear_printer_cache(self) -> Dict:
+        """Clear persistent printer cache."""
+        self._record_runtime_event("printer_cache_cleared")
+        self.printer_manager.clear_cache()
+        return {"success": True, "message": "Printer cache cleared successfully"}
 
     def get_status(self) -> Dict:
         """Get current status for API."""

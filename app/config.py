@@ -22,6 +22,7 @@ class Config:
         'log_level': 'INFO',
         'saved_printers': [],
         'printer_aliases': {},
+        'custom_subnets': ['192.168.0.0/22'],
     }
 
     def __init__(self, config_path: str = None):
@@ -92,6 +93,15 @@ class Config:
     @property
     def saved_printers(self) -> List:
         return self._config.get('saved_printers', [])
+
+    @property
+    def custom_subnets(self) -> List[str]:
+        return self._config.get('custom_subnets', ['192.168.0.0/22'])
+
+    @custom_subnets.setter
+    def custom_subnets(self, value: List[str]):
+        self._config['custom_subnets'] = value
+        self._save()
 
     def get(self, key: str, default=None):
         return self._config.get(key, default)

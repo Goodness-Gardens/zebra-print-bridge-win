@@ -207,7 +207,7 @@ class ZebraBridgeApp(ctk.CTk):
             toolbar, text="🌐  Scan Network", width=140, height=32,
             font=ctk.CTkFont(size=12, weight="bold"),
             fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=True),
+            corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=True, clear_cache=True),
         )
         self.scan_net_btn.pack(side="right", padx=(6, 0))
 
@@ -215,7 +215,7 @@ class ZebraBridgeApp(ctk.CTk):
             toolbar, text="🔄  Refresh", width=110, height=32,
             font=ctk.CTkFont(size=12),
             fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
-            corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=False),
+            corner_radius=8, command=lambda: self._refresh_printers_async(force_subnet_scan=True, clear_cache=True),
         )
         self.refresh_btn.pack(side="right")
 
@@ -330,25 +330,30 @@ class ZebraBridgeApp(ctk.CTk):
                 text=f"{count_net} network printer(s)  •  {count_loc} local printer(s)"
             )
 
-    def _refresh_printers_async(self, force_subnet_scan: bool = False):
+    def _refresh_printers_async(self, force_subnet_scan: bool = False, clear_cache: bool = False):
         """Asynchronously refresh network and local printer lists."""
         if not self.bridge:
             return
 
         def _worker():
             try:
-                if force_subnet_scan:
+                if clear_cache or force_subnet_scan:
                     self.after(0, lambda: self._set_scanning_state(True))
-                    self._append_log_safe("[INFO] Starting subnet scan for Zebra printers...")
-                    self.bridge.printer_manager.scan_subnet()
-                    self._append_log_safe("[INFO] Subnet scan completed.")
+                    if clear_cache:
+                        self._append_log_safe("[INFO] Clearing printer cache...")
+                        self.bridge.printer_manager.clear_cache()
+                    self._append_log_safe("[INFO] Scanning current network for Zebra printers...")
+                    self.bridge.printer_manager.scan_subnet(clear_cache=clear_cache)
+                    self._append_log_safe("[INFO] Network scan completed.")
                 else:
-                    self.bridge.printer_manager.refresh_known_printers()
+                    self.bridge.printer_manager.refresh_known_printers(prune_unreachable=True)
 
                 net = self.bridge.list_network_printers()
                 loc = self.bridge.list_local_printers()
 
                 self.after(0, lambda: self._render_printers(net, loc))
+                if clear_cache or force_subnet_scan:
+                    self._append_log_safe(f"[INFO] Found {len(net)} network printer(s) on current network.")
             except Exception as exc:
                 logger.error("Error refreshing printers: %s", exc)
                 self._append_log_safe(f"[ERROR] Error refreshing printers: {exc}")
@@ -604,7 +609,8 @@ class ZebraBridgeApp(ctk.CTk):
         self._start_stats_polling()
 
         # Initial printer list population
-        self.after(600, lambda: self._refresh_printers_async(force_subnet_scan=False))
+        has_printers = bool(self.bridge.list_network_printers())
+        self.after(600, lambda: self._refresh_printers_async(force_subnet_scan=not has_printers))
 
     def _stop_server(self):
         if not self.server_running or not self.bridge:

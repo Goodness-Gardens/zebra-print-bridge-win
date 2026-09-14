@@ -172,8 +172,8 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     }
 
 
-def get_local_subnets() -> List[ipaddress.IPv4Network]:
-    """Detect local IPv4 network subnets automatically."""
+def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Network]:
+    """Detect local IPv4 network subnets automatically and merge custom/VPN subnets."""
     subnets = []
     # Try ifconfig on macOS / Linux
     try:
@@ -187,7 +187,7 @@ def get_local_subnets() -> List[ipaddress.IPv4Network]:
                 hex_val = int(m.group(2), 16)
                 mask_str = socket.inet_ntoa(hex_val.to_bytes(4, "big"))
                 net = ipaddress.IPv4Network(f"{ip}/{mask_str}", strict=False)
-                if net.prefixlen >= 20 and net not in subnets:
+                if 20 <= net.prefixlen <= 30 and net not in subnets:
                     subnets.append(net)
     except Exception:
         pass
@@ -200,6 +200,19 @@ def get_local_subnets() -> List[ipaddress.IPv4Network]:
                 subnets.append(ipaddress.IPv4Network(f"{local_ip}/24", strict=False))
         except Exception:
             pass
+
+    # Add custom / VPN subnets (e.g. 192.168.0.0/22 for corporate VPN)
+    for s in (custom_subnets or []):
+        if not s:
+            continue
+        try:
+            net = ipaddress.IPv4Network(str(s).strip(), strict=False)
+            already_covered = any(net.subnet_of(existing) for existing in subnets)
+            if not already_covered:
+                subnets = [existing for existing in subnets if not existing.subnet_of(net)]
+                subnets.append(net)
+        except Exception as e:
+            logger.warning("Invalid custom subnet '%s': %s", s, e)
 
     return subnets
 
@@ -220,11 +233,13 @@ class PrinterManager:
         network_timeout: float = 0.5,
         saved_printers: List[Dict] = None,
         printer_aliases: Dict[str, str] = None,
+        custom_subnets: List[str] = None,
     ):
         self.scan_network = scan_network
         self.network_timeout = network_timeout
         self.saved_printers = saved_printers or []
         self.printer_aliases = {k.lower(): v for k, v in (printer_aliases or {}).items()}
+        self.custom_subnets = custom_subnets or ["192.168.0.0/22"]
 
         # Persistent printer cache directory and file
         self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
@@ -360,9 +375,22 @@ class PrinterManager:
 
         self._alias_map = mapping
 
-    def refresh_known_printers(self) -> bool:
+    def clear_cache(self):
+        """Clear discovered network printers cache in memory and delete the cache file on disk."""
+        with self._lock:
+            self._network_printers.clear()
+            self._rebuild_alias_map_locked()
+        try:
+            if self.cache_file.exists():
+                self.cache_file.unlink()
+                logger.info("Deleted network printer cache file: %s", self.cache_file)
+        except Exception as e:
+            logger.warning("Failed to delete network printer cache file: %s", e)
+
+    def refresh_known_printers(self, prune_unreachable: bool = True) -> bool:
         """
-        Quickly poll all currently known printer IPs (<100ms) to detect renames or offline status.
+        Quickly poll all currently known printer IPs (<100ms) to detect renames,
+        updates, and optionally prune offline/unreachable printers.
         Returns True if any changes occurred.
         """
         known_ips = set()
@@ -376,6 +404,7 @@ class PrinterManager:
             return False
 
         changed = False
+        unreachable_ips = set()
         with concurrent.futures.ThreadPoolExecutor(max_workers=len(known_ips) or 1) as ex:
             futures = {ex.submit(probe_zebra_printer, ip, 0.6): ip for ip in known_ips}
             for fut in concurrent.futures.as_completed(futures):
@@ -388,20 +417,38 @@ class PrinterManager:
                             if not existing or existing.get("name") != res.get("name") or existing.get("unique_id") != res.get("unique_id"):
                                 self._network_printers[ip] = res
                                 changed = True
+                    else:
+                        unreachable_ips.add(ip)
                 except Exception:
-                    pass
+                    unreachable_ips.add(ip)
+
+        if prune_unreachable and unreachable_ips:
+            with self._lock:
+                for ip in unreachable_ips:
+                    if ip in self._network_printers:
+                        del self._network_printers[ip]
+                        changed = True
 
         if changed:
             with self._lock:
                 self._rebuild_alias_map_locked()
-            self._save_cache()
+            if self._network_printers:
+                self._save_cache()
+            elif self.cache_file.exists():
+                try:
+                    self.cache_file.unlink()
+                except Exception:
+                    pass
             logger.info("Updated printer aliases from network: %s", {p["name"]: p["ip"] for p in self._network_printers.values()})
 
         return changed
 
-    def scan_subnet(self) -> Dict[str, Dict]:
+    def scan_subnet(self, clear_cache: bool = False) -> Dict[str, Dict]:
         """Scan all local subnets for port 9100 Zebra printers concurrently."""
-        subnets = get_local_subnets()
+        if clear_cache:
+            self.clear_cache()
+
+        subnets = get_local_subnets(self.custom_subnets)
         if not subnets:
             return {}
 
@@ -423,12 +470,21 @@ class PrinterManager:
                 except Exception:
                     pass
 
-        if discovered:
-            with self._lock:
+        with self._lock:
+            if clear_cache:
+                self._network_printers = discovered
+            else:
                 self._network_printers.update(discovered)
-                self._rebuild_alias_map_locked()
+            self._rebuild_alias_map_locked()
+
+        if self._network_printers:
             self._save_cache()
             logger.info("Discovered %d Zebra printers on network: %s", len(discovered), [p["name"] for p in discovered.values()])
+        elif clear_cache and self.cache_file.exists():
+            try:
+                self.cache_file.unlink()
+            except Exception:
+                pass
 
         return discovered
 
