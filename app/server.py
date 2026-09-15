@@ -14,6 +14,7 @@ import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
 from pydantic import BaseModel
 
 from . import __version__
@@ -168,7 +169,7 @@ class PrintServer:
             }
 
         @app.get("/status")
-        async def get_status():
+        def get_status():
             """Get current server status and queue metrics."""
             self._record_usage("status_requested", log=False)
             server_hostname = get_hostname()
@@ -196,7 +197,7 @@ class PrintServer:
             return {"healthy": True}
 
         @app.get("/info")
-        async def get_info():
+        def get_info():
             """Get server info including network IP and MAC for remote access."""
             self._record_usage("info_requested")
             local_ip = self._get_local_ip()
@@ -255,7 +256,7 @@ class PrintServer:
             }
 
         @app.get("/connection", response_model=ConnectionCheckResponse)
-        async def check_connection(
+        def check_connection(
             request: Request,
             printer_mac: Optional[str] = None,
             mac: Optional[str] = None,
@@ -381,7 +382,7 @@ class PrintServer:
         # CORS preflight is handled automatically by CORSMiddleware
 
         @app.post("/print", response_model=PrintResponse)
-        async def print_label(job: PrintJob, request: Request):
+        def print_label(job: PrintJob, request: Request):
             """Send a raw command using JSON payload."""
             if not self.on_job_received:
                 raise HTTPException(status_code=500, detail="Print handler not configured")
@@ -521,7 +522,8 @@ class PrintServer:
             )
 
             try:
-                result = self.on_job_received(
+                result = await run_in_threadpool(
+                    self.on_job_received,
                     {
                         "printer_name": printer_name,
                         "printer_mac": printer_mac,
@@ -530,7 +532,7 @@ class PrintServer:
                         "source": source,
                         "id": request_id,
                         "is_localhost": is_localhost,
-                    }
+                    },
                 )
                 if not result.get("success", False):
                     self._record_usage(
@@ -581,7 +583,7 @@ class PrintServer:
             return self._get_test_client_html()
 
         @app.get("/logs")
-        async def get_logs():
+        def get_logs():
             """Get recent activity logs."""
             if self.on_status_request:
                 status = self.on_status_request()
@@ -595,7 +597,7 @@ class PrintServer:
             return {"logs": [], "usage": self._get_usage_snapshot()}
 
         @app.post("/logs/clear")
-        async def clear_logs():
+        def clear_logs():
             """Clear runtime history and truncate active log files."""
             cleared_runtime = {}
             if self.on_logs_clear:
@@ -615,7 +617,7 @@ class PrintServer:
             }
 
         @app.get("/printers")
-        async def list_printers(refresh: bool = False):
+        def list_printers(refresh: bool = False):
             """List both network and local OS-installed printers. Pass ?refresh=true to clear cache and re-scan."""
             if refresh and self.on_refresh_printers:
                 self._record_usage("printers_refresh_requested")
@@ -649,7 +651,7 @@ class PrintServer:
             }
 
         @app.post("/printers/refresh")
-        async def refresh_printers_endpoint():
+        def refresh_printers_endpoint():
             """Clear printer cache, re-scan local network, and return fresh printer list."""
             self._record_usage("printers_refresh_requested")
             if not self.on_refresh_printers:
@@ -674,7 +676,7 @@ class PrintServer:
                 raise HTTPException(status_code=500, detail=str(e))
 
         @app.post("/printers/clear")
-        async def clear_printers_cache_endpoint():
+        def clear_printers_cache_endpoint():
             """Clear the persistent printer cache."""
             self._record_usage("printers_clear_requested")
             if not self.on_clear_printer_cache:
