@@ -39,7 +39,7 @@ web applications and sends them directly to Zebra printers over the network via 
 2. Run the installer and follow the wizard.
 3. Launch **Zebra Print Bridge** from the Start Menu or Desktop shortcut.
 
-### Option C: Source Code (Development)
+### Option B: Source Code (Development)
 
 ```bash
 # Clone the repository
@@ -88,16 +88,40 @@ Options:
 
 ### Configuration
 
-The application stores its config in `~/.config/zebra-print-bridge/config.json`.
+The application stores its config in `~/.config/zebra-print-bridge/config.json` (or `<custom_dir>/config.json` via `--config`).
 Available fields include:
 
 ```json
 {
   "port": 5050,
-  "log_level": "INFO",
-  "web_interface": true,
+  "scan_network": true,
   "network_timeout": 0.5,
-  "auto_start": false
+  "log_level": "INFO",
+  "saved_printers": [],
+  "printer_aliases": {},
+  "custom_subnets": ["192.168.0.0/22"],
+  "verify_identity": true,
+  "strict_identity": false,
+  "discovery_broadcast": false
+}
+```
+
+### Persistent Printer Cache (v2)
+
+Discovered network printers are persisted to `~/.config/zebra-print-bridge/network_printers.json` (or `<config_dir>/network_printers.json`).
+The cache is indexed by device identity (MAC address), ensuring printer mappings survive DHCP IP changes:
+
+```json
+{
+  "00:07:4D:6F:C2:14": {
+    "mac": "00:07:4D:6F:C2:14",
+    "serial": "ZEB123456",
+    "ip": "192.168.1.150",
+    "port": 9100,
+    "name": "Zebra ZD420",
+    "mac_source": "snmp",
+    "last_seen": "2026-09-15T12:00:00.000000"
+  }
 }
 ```
 
@@ -315,23 +339,43 @@ curl -X POST http://192.168.1.100:5050/print \
 ```
 
 **Resolution & Fallback Hierarchy:**
-1. **Primary (`printer_name`)**: If provided, attempts to print to this OS-installed printer.
-2. **Fallback 1 (Default OS Printer)**: If `printer_name` is not found (or omitted), falls back to the system's default printer.
-3. **Fallback 2 (`printer_ip`)**: If neither local printer is available and `printer_ip` is specified, routes to the network printer via TCP/IP port 9100.
+1. **Priority 1 (`printer_mac`)**: Resolves the printer dynamically by Ethernet MAC address (e.g. `00:07:4D:6F:C2:14`). Survives DHCP IP changes.
+   - **`printer_ip` as Hint**: If `printer_ip` is provided alongside `printer_mac`, the bridge tests this IP first. If the device at that IP matches the expected MAC, resolution is instant without scanning or ARP lookups.
+   - **Identity Verification**: When `verify_identity=true`, probes the device via SNMP (`ifPhysAddress`, Zebra serial number) and ARP. Returns one of three states:
+     - `"match"`: Device MAC/serial matches expected identity.
+     - `"mismatch"`: Device MAC/serial contradicts expected identity; invalidates cached IP.
+     - `"unverifiable"`: Device does not answer SNMP/ARP. By default allows printing with a warning (fail-open). If `strict_identity=true`, the job is rejected with HTTP 503.
+2. **Priority 2 (`printer_ip` / `printer_host`)**: Direct IPv4 address, network DNS hostname, mDNS name (`.local`), alias, or simulated `"test"`.
+3. **Priority 3 (`printer_name`)**: Local OS printer installed in the spooler (Windows spooler or CUPS).
+4. **Priority 4 (Default OS Printer)**: Fallback when no target is specified or local printer name is not found.
 
 **Parameters:**
 
 | Parameter      | Type   | Required | Description                                              |
 |----------------|--------|----------|----------------------------------------------------------|
-| `printer_name` | string | No       | **Primary**: Name of local/USB printer installed in OS   |
-| `printer_ip`   | string | No       | **Fallback**: Printer IPv4 address, hostname, or `"test"` (alias: `printer_host`) |
+| `printer_mac`  | string | No       | **Priority 1 (Recommended)**: Ethernet MAC address (e.g. `00:07:4D:6F:C2:14`). Dynamic resolution immune to DHCP IP changes. |
+| `printer_ip`   | string | No       | **Priority 2**: Printer IPv4 address, hostname, or `"test"`. Serves as instant cache hint when passed alongside `printer_mac`. (alias: `printer_host`) |
+| `printer_name` | string | No       | **Priority 3**: Name of local/USB printer installed in OS spooler. |
 | `raw_command`  | string | Yes      | Raw ZPL command string (alias: `zpl` for legacy payload) |
 | `source`       | string | No       | Source label for tracking (default: `"Web API"`)         |
 | `id`           | string | No       | Custom job ID                                            |
 | `dpi`          | int    | No       | Printer resolution (informational only)                  |
 | `label_size`   | object | No       | Label dimensions `{width, height}` (informational)       |
 
-*\* If neither `printer_name` nor `printer_ip` is specified, the server automatically routes to the default OS printer.*
+*\* If no target is specified, the server automatically routes to the default OS printer.*
+
+**Example: Printing via MAC address with IP hint:**
+
+```bash
+curl -X POST http://192.168.1.100:5050/print \
+  -H "Content-Type: application/json" \
+  -d '{
+    "printer_mac": "00:07:4D:6F:C2:14",
+    "printer_ip": "192.168.1.50",
+    "raw_command": "^XA^FO50,50^A0N,50,50^FDHello World^FS^XZ",
+    "source": "Warehouse App"
+  }'
+```
 
 **Response:**
 

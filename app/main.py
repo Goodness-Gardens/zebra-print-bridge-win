@@ -158,6 +158,8 @@ class PrintBridge:
             on_list_printers=self.list_printers,
             on_refresh_printers=self.refresh_printers,
             on_clear_printer_cache=self.clear_printer_cache,
+            verify_identity=getattr(self.config, "verify_identity", True),
+            strict_identity=getattr(self.config, "strict_identity", False),
         )
 
         self.running = True

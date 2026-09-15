@@ -83,6 +83,8 @@ class PrintServer:
         on_list_printers: Callable = None,
         on_refresh_printers: Callable = None,
         on_clear_printer_cache: Callable = None,
+        verify_identity: bool = True,
+        strict_identity: bool = False,
     ):
         self.port = port
         self.on_job_received = on_job_received
@@ -92,6 +94,8 @@ class PrintServer:
         self.on_list_printers = on_list_printers
         self.on_refresh_printers = on_refresh_printers
         self.on_clear_printer_cache = on_clear_printer_cache
+        self.verify_identity = verify_identity
+        self.strict_identity = strict_identity
         self.is_running = False
         self.start_time = None
         self.resource_dir = Path(__file__).resolve().parent.parent / "resources"
@@ -228,16 +232,24 @@ class PrintServer:
                 "required_fields": {
                     "json_print": [
                         "raw_command (or legacy field 'zpl')",
-                        "printer_mac (Ethernet MAC address, resolves dynamically to current IP, immune to DHCP IP changes)",
-                        "printer_name (local OS printer), default OS printer (fallback 1), or printer_ip / printer_host (fallback 2)",
+                        "printer_mac (Ethernet MAC address, Priority 1: resolves dynamically to current IP, immune to DHCP changes)",
+                        "printer_ip / printer_host (Priority 2: IPv4 address, hostname, or IP hint when combined with printer_mac)",
+                        "printer_name (Priority 3: local OS spooler printer)",
+                        "OS default printer (Priority 4: fallback when no target specified)",
                     ],
-                    "raw_print": ["printer_mac, printer_ip or printer_name (query, MAC, IPv4, hostname, or 'test')", "raw body"],
+                    "raw_print": ["printer_mac, printer_ip or printer_name (query: MAC, IPv4, hostname, or 'test')", "raw body"],
                 },
                 "supported_targets": {
-                    "printer_mac": "Ethernet MAC address (e.g. '00:07:4D:6F:C2:14', '00-07-4D-6F-C2-14', '00074d6fc214') - dynamic ARP/cache IP resolution",
-                    "printer_ip": "Direct IPv4 address (e.g. '192.168.1.150') or simulated 'test'",
-                    "printer_host": "Network DNS hostname or alias (e.g. 'NH-LSHIP1')",
-                    "printer_name": "Local OS printer installed in spooler",
+                    "printer_mac": "Ethernet MAC address (e.g. '00:07:4D:6F:C2:14') - dynamic ARP/cache IP resolution (Priority 1)",
+                    "printer_ip": "Direct IPv4 address (e.g. '192.168.1.150'), simulated 'test', or IP hint with printer_mac (Priority 2)",
+                    "printer_host": "Network DNS hostname or alias (e.g. 'NH-LSHIP1') (Priority 2)",
+                    "printer_name": "Local OS printer installed in spooler (Priority 3)",
+                    "default_os_printer": "Default printer configured in OS spooler (Priority 4)",
+                },
+                "identity_verification": {
+                    "verify_identity": self.verify_identity,
+                    "strict_identity": self.strict_identity,
+                    "states": ["match", "mismatch", "unverifiable"],
                 },
                 "endpoints": {
                     "print": "/print (POST JSON, supports printer_mac, printer_ip, printer_host, printer_name)",

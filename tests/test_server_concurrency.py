@@ -60,3 +60,26 @@ async def test_server_concurrency_health_not_blocked_by_raw_print():
 
         print_resp = await print_task
         assert print_resp.status_code == 200
+
+
+@pytest.mark.anyio
+async def test_server_info_identity_verification():
+    """Verify that /info exposes the resolution hierarchy and identity_verification block."""
+    server = PrintServer(port=8000, verify_identity=True, strict_identity=True)
+    transport = httpx.ASGITransport(app=server.app)
+
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        resp = await client.get("/info")
+        assert resp.status_code == 200
+        data = resp.json()
+
+        assert "identity_verification" in data
+        assert data["identity_verification"] == {
+            "verify_identity": True,
+            "strict_identity": True,
+            "states": ["match", "mismatch", "unverifiable"],
+        }
+        assert "printer_mac" in data["supported_targets"]
+        assert "default_os_printer" in data["supported_targets"]
+        assert any("Priority 1" in item for item in data["required_fields"]["json_print"])
+
