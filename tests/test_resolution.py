@@ -325,4 +325,12 @@ class TestPrintBridgeResolution(unittest.TestCase):
             self.assertFalse(res["success"])
             self.assertIn("Cannot resolve", res["message"])
 
+    def test_discover_broadcast_stub(self):
+        # Disabled by default
+        self.assertFalse(self.bridge.printer_manager.discovery_broadcast)
+        self.assertEqual(self.bridge.printer_manager.discover_broadcast(), [])
+        # When enabled, stub safely returns empty list
+        self.bridge.printer_manager.discovery_broadcast = True
+        self.assertEqual(self.bridge.printer_manager.discover_broadcast(), [])
+
 

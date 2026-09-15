@@ -25,6 +25,7 @@ class Config:
         'custom_subnets': ['192.168.0.0/22'],
         'verify_identity': True,
         'strict_identity': False,
+        'discovery_broadcast': False,
     }
 
     def __init__(self, config_path: str = None):

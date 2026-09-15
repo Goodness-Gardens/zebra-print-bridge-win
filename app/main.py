@@ -72,6 +72,7 @@ class PrintBridge:
             verify_identity=self.config.verify_identity,
             strict_identity=self.config.strict_identity,
             cache_dir=self.config.config_dir,
+            discovery_broadcast=getattr(self.config, "discovery_broadcast", False),
         )
 
         self.print_queue = queue.Queue()

@@ -428,6 +428,7 @@ class PrinterManager:
         verify_identity: bool = True,
         strict_identity: bool = False,
         cache_dir: Optional[Path] = None,
+        discovery_broadcast: bool = False,
     ):
         self.scan_network = scan_network
         self.network_timeout = network_timeout
@@ -436,6 +437,7 @@ class PrinterManager:
         self.custom_subnets = custom_subnets or ["192.168.0.0/22"]
         self.verify_identity = verify_identity
         self.strict_identity = strict_identity
+        self.discovery_broadcast = discovery_broadcast
 
         # Persistent printer cache directory and file
         if cache_dir is not None:
@@ -903,6 +905,24 @@ class PrinterManager:
             return res == 0
         except Exception:
             return False
+
+    def discover_broadcast(self, timeout: float = 2.0) -> List[Dict]:
+        """
+        Discover Zebra printers via UDP 4201 broadcast.
+
+        TODO (M8): Zebra Link-OS printers support discovery via directed or subnet broadcast
+        on UDP port 4201 (used by Zebra Setup Utilities and Link-OS SDK NetworkDiscoverer).
+        However, the exact wire format for the discovery request and response payload
+        (e.g., DiscoveryPacket / DiscoveryPacketDecoder framing and magic bytes) requires
+        reverse-engineering the proprietary binary structure or referencing official Zebra SDK
+        documentation that is not publicly open without proprietary licensing.
+        Until confirmed with official specification, this feature remains a non-blocking stub
+        guarded behind discovery_broadcast=False to ensure reliability and zero unwanted traffic.
+        """
+        if not self.discovery_broadcast:
+            return []
+        logger.debug("discover_broadcast called but UDP 4201 protocol specification is pending.")
+        return []
 
     def verify_device_identity(
         self,
