@@ -1,4 +1,3 @@
-from pathlib import Path
 from tests.conftest import (
     REAL_CACHE_FILE,
     _INITIAL_EXISTS,

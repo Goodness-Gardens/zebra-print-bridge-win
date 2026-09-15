@@ -29,7 +29,6 @@ from .utils import (
     get_mac_for_ip,
     get_ip_for_mac,
     parse_target_address_port,
-    normalize_target,
     run_command,
 )
 

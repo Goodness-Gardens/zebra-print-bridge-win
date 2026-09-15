@@ -25,6 +25,7 @@ from app.server import PrintServer
 from app.utils import (
     get_hostname,
     get_local_ip,
+    get_local_mac,
     is_valid_mac,
     normalize_raw_command,
     normalize_target,
@@ -324,8 +325,6 @@ class PrintBridge:
         job_id = str(job_data.get("id") or "").strip() or datetime.now().strftime(
             "%H%M%S%f"
         )
-
-        is_localhost = job_data.get("is_localhost", False)
 
         if not raw_command.strip():
             return {"success": False, "message": "raw_command is required"}

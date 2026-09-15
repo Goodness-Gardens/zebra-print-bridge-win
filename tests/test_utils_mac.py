@@ -1,12 +1,10 @@
-import platform
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from app.utils import (
     get_ip_for_mac,
     get_local_mac,
     get_mac_for_ip,
-    run_command,
     _local_mac_cache,
 )
 
