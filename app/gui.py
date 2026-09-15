@@ -415,9 +415,13 @@ class ZebraBridgeApp(ctk.CTk):
         ).pack(side="left")
 
         # Status badge
+        is_offline = (p.get("status") == "offline") or not (p.get("address") or p.get("ip"))
+        status_text = "● Offline" if is_offline else "● Online"
+        status_color = RED if is_offline else GREEN
+
         ctk.CTkLabel(
-            top_row, text="● Online",
-            font=ctk.CTkFont(size=11, weight="bold"), text_color=GREEN,
+            top_row, text=status_text,
+            font=ctk.CTkFont(size=11, weight="bold"), text_color=status_color,
         ).pack(side="right")
 
         # Hostname & IP details
@@ -427,11 +431,13 @@ class ZebraBridgeApp(ctk.CTk):
         hostname = p.get("hostname") or "—"
         ip = p.get("address") or p.get("ip") or ""
         port = p.get("port", 9100)
-        mac = p.get("mac_address") or "—"
+        mac = p.get("mac_address") or p.get("mac") or "—"
+        mac_source = p.get("mac_source")
 
         if mac and mac != "—":
+            mac_display = f"MAC:  {mac} ({mac_source})" if mac_source else f"MAC:  {mac}"
             ctk.CTkLabel(
-                info_frame, text=f"MAC:  {mac}",
+                info_frame, text=mac_display,
                 font=ctk.CTkFont(family="Consolas", size=12, weight="bold"), text_color=TEXT_MAIN,
             ).pack(anchor="w")
 
@@ -440,8 +446,13 @@ class ZebraBridgeApp(ctk.CTk):
             font=ctk.CTkFont(size=12), text_color=TEXT_DIM,
         ).pack(anchor="w")
 
+        if is_offline or not ip:
+            ip_display = "IP:  última IP desconocida"
+        else:
+            ip_display = f"IP:  {ip}:{port}"
+
         ctk.CTkLabel(
-            info_frame, text=f"IP:  {ip}:{port}",
+            info_frame, text=ip_display,
             font=ctk.CTkFont(family="Consolas", size=12), text_color=TEXT_MAIN,
         ).pack(anchor="w", pady=(1, 6))
 
@@ -459,22 +470,26 @@ class ZebraBridgeApp(ctk.CTk):
             copy_mac_btn.configure(command=lambda m=mac, b=copy_mac_btn: self._copy_to_clipboard(m, b, "📋 Copy MAC"))
             copy_mac_btn.pack(side="left", padx=(0, 6))
 
-        copy_btn = ctk.CTkButton(
-            btn_row, text="📋 Copy IP", width=95, height=26,
-            font=ctk.CTkFont(size=11),
-            fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
-            corner_radius=6,
-        )
-        copy_btn.configure(command=lambda i=ip, b=copy_btn: self._copy_to_clipboard(i, b, "📋 Copy IP"))
-        copy_btn.pack(side="left", padx=(0, 6))
+        if not is_offline and ip:
+            copy_btn = ctk.CTkButton(
+                btn_row, text="📋 Copy IP", width=95, height=26,
+                font=ctk.CTkFont(size=11),
+                fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
+                corner_radius=6,
+            )
+            copy_btn.configure(command=lambda i=ip, b=copy_btn: self._copy_to_clipboard(i, b, "📋 Copy IP"))
+            copy_btn.pack(side="left", padx=(0, 6))
 
         test_btn = ctk.CTkButton(
             btn_row, text="🔌 Test", width=80, height=26,
             font=ctk.CTkFont(size=11),
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            fg_color=ACCENT if not is_offline else "#cbd5e1",
+            hover_color=ACCENT_HOVER if not is_offline else "#cbd5e1",
+            state="normal" if not is_offline else "disabled",
             corner_radius=6,
         )
-        test_btn.configure(command=lambda: self._test_network_printer(p, test_btn))
+        if not is_offline:
+            test_btn.configure(command=lambda: self._test_network_printer(p, test_btn))
         test_btn.pack(side="left")
 
     def _create_local_printer_card(self, p: Dict):
