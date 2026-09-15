@@ -43,8 +43,7 @@ def test_v1_to_v2_cache_migration():
         with open(cache_file, "w", encoding="utf-8") as f:
             json.dump(v1_data, f)
 
-        pm = PrinterManager(scan_network=False)
-        pm.cache_file = cache_file
+        pm = PrinterManager(scan_network=False, cache_dir=Path(tmpdir))
         pm._load_cache()
 
         # Check in-memory structure

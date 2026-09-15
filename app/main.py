@@ -76,6 +76,7 @@ class PrintBridge:
             printer_aliases=self.config.get("printer_aliases", {}),
             custom_subnets=self.config.custom_subnets,
             verify_identity=self.config.verify_identity,
+            cache_dir=self.config.config_dir,
         )
 
         self.print_queue = queue.Queue()

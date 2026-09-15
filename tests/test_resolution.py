@@ -1,4 +1,6 @@
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from app.printer_manager import PrinterManager
@@ -8,13 +10,18 @@ from app.config import Config
 
 class TestResolution(unittest.TestCase):
     def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
         self.pm = PrinterManager(
             scan_network=False,
             network_timeout=0.1,
             verify_identity=True,
+            cache_dir=Path(self.tmp_dir.name),
         )
         self.pm._network_printers.clear()
         self.pm._alias_map.clear()
+
+    def tearDown(self):
+        self.tmp_dir.cleanup()
 
     def test_mac_cache_hit_verified(self):
         mac = "00:11:22:33:44:55"
@@ -133,21 +140,26 @@ class TestResolution(unittest.TestCase):
 
 class TestPrintBridgeResolution(unittest.TestCase):
     def setUp(self):
+        self.tmp_dir = tempfile.TemporaryDirectory()
         config = MagicMock(spec=Config)
         config.saved_printers = []
         config.get.return_value = {}
         config.custom_subnets = []
         config.verify_identity = True
+        config.scan_network = False
+        config.network_timeout = 0.1
+        config.log_level = "INFO"
+        config.config_dir = Path(self.tmp_dir.name)
         config.port = 5050
         config.printer_ip = "127.0.0.1"
         config.printer_port = 9100
 
         with patch("app.main.PrintServer"):
             self.bridge = PrintBridge(config=config)
-        self.bridge.printer_manager.scan_network = False
 
     def tearDown(self):
         self.bridge.stop()
+        self.tmp_dir.cleanup()
 
     def test_on_job_received_test_mode(self):
         job_data = {

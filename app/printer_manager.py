@@ -358,6 +358,7 @@ class PrinterManager:
         printer_aliases: Dict[str, str] = None,
         custom_subnets: List[str] = None,
         verify_identity: bool = True,
+        cache_dir: Optional[Path] = None,
     ):
         self.scan_network = scan_network
         self.network_timeout = network_timeout
@@ -367,7 +368,10 @@ class PrinterManager:
         self.verify_identity = verify_identity
 
         # Persistent printer cache directory and file
-        self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
+        if cache_dir is not None:
+            self.cache_dir = Path(cache_dir)
+        else:
+            self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "network_printers.json"
 
