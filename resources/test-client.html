@@ -573,8 +573,10 @@
           const data = await response.json();
 
           const hostLabel = (data.server_hostname || data.hostname) ? ` (${data.server_hostname || data.hostname})` : "";
-          statusText.textContent = `Connected - ${data.mode || "raw_printing"}${hostLabel}`;
-          log(`Connected to server: ${data.network_url || data.local_url}${hostLabel}`);
+          const macVal = data.server_mac || data.network_mac || data.mac_address || data.mac;
+          const macLabel = macVal ? ` [MAC: ${macVal}]` : "";
+          statusText.textContent = `Connected - ${data.mode || "raw_printing"}${hostLabel}${macLabel}`;
+          log(`Connected to server: ${data.network_url || data.local_url}${hostLabel}${macLabel}`);
 
           refreshStats();
         } catch (error) {

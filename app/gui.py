@@ -21,7 +21,7 @@ from app import __version__
 from app.config import Config, get_platform_info
 from app.main import PrintBridge, setup_logging
 from app.updater import check_for_updates_async, download_installer, launch_installer_and_exit
-from app.utils import get_local_ip, get_hostname
+from app.utils import get_local_ip, get_local_mac, get_hostname
 
 logger = logging.getLogger(__name__)
 
@@ -295,9 +295,11 @@ class ZebraBridgeApp(ctk.CTk):
 
         platform_info = get_platform_info()
         plat_text = platform_info.get("platform", f"{platform_info.get('system', '')} {platform_info.get('machine', '')}")
+        local_mac = get_local_mac()
+        mac_text = f"  •  MAC: {local_mac}" if local_mac else ""
 
         ctk.CTkLabel(
-            footer, text=f"Platform: {plat_text}",
+            footer, text=f"Platform: {plat_text}{mac_text}",
             font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
         ).pack(side="left")
 

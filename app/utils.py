@@ -7,6 +7,8 @@ import platform
 import re
 import socket
 import subprocess
+import uuid
+from pathlib import Path
 from typing import Optional, Tuple, Dict
 
 HOSTNAME_LABEL_REGEX = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?$")
@@ -132,10 +134,119 @@ def is_valid_mac(mac: str) -> bool:
     return normalize_mac(mac) is not None
 
 
+def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
+    """
+    Get the MAC address of the local machine, preferably matching the provided IP
+    (or default network IP) for the active network interface.
+    """
+    if not ip:
+        ip = get_local_ip()
+
+    system = platform.system()
+
+    # 1. macOS / Linux: Try ifconfig
+    if system in ("Darwin", "Linux"):
+        try:
+            out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+            blocks = re.split(r"\n(?=[a-zA-Z0-9_-]+:)", out)
+            matched_mac = None
+            first_active_mac = None
+            for b in blocks:
+                m_mac = re.search(
+                    r"(?:ether|HWaddr)\s+([0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2})",
+                    b,
+                )
+                if not m_mac:
+                    continue
+                cand_mac = normalize_mac(m_mac.group(1))
+                if not cand_mac:
+                    continue
+                m_ip = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)", b)
+                if m_ip:
+                    cand_ip = m_ip.group(1)
+                    if not cand_ip.startswith("127."):
+                        if not first_active_mac:
+                            first_active_mac = cand_mac
+                        if ip and cand_ip == ip:
+                            matched_mac = cand_mac
+                            break
+            if matched_mac:
+                return matched_mac
+            if first_active_mac:
+                return first_active_mac
+        except Exception:
+            pass
+
+    # 2. Linux: Try /sys/class/net and ip route / ip addr
+    if system == "Linux":
+        try:
+            if ip:
+                out = subprocess.check_output(["ip", "-o", "addr", "show"], text=True, stderr=subprocess.DEVNULL)
+                for line in out.splitlines():
+                    if ip in line:
+                        parts = line.split()
+                        if len(parts) >= 2:
+                            dev = parts[1]
+                            addr_path = Path(f"/sys/class/net/{dev}/address")
+                            if addr_path.exists():
+                                norm = normalize_mac(addr_path.read_text().strip())
+                                if norm:
+                                    return norm
+        except Exception:
+            pass
+
+    # 3. Windows: Try ipconfig /all
+    if system == "Windows":
+        try:
+            out = subprocess.check_output(["ipconfig", "/all"], text=True, stderr=subprocess.DEVNULL)
+            blocks = re.split(r"\n(?=[^\s].*?:)", out)
+            matched_mac = None
+            first_active_mac = None
+            for b in blocks:
+                m_mac = re.search(r"([0-9a-fA-F]{2}(?:-[0-9a-fA-F]{2}){5})", b)
+                if not m_mac:
+                    m_mac = re.search(r"([0-9a-fA-F]{2}(?::[0-9a-fA-F]{2}){5})", b)
+                if not m_mac:
+                    continue
+                cand_mac = normalize_mac(m_mac.group(1))
+                if not cand_mac:
+                    continue
+                m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", b)
+                if m_ip:
+                    cand_ip = m_ip.group(1)
+                    if not cand_ip.startswith("127."):
+                        if not first_active_mac:
+                            first_active_mac = cand_mac
+                        if ip and cand_ip == ip:
+                            matched_mac = cand_mac
+                            break
+            if matched_mac:
+                return matched_mac
+            if first_active_mac:
+                return first_active_mac
+        except Exception:
+            pass
+
+    # 4. Fallback: uuid.getnode()
+    try:
+        node = uuid.getnode()
+        mac_hex = f"{node:012X}"
+        if len(mac_hex) == 12:
+            return normalize_mac(mac_hex)
+    except Exception:
+        pass
+
+    return None
+
+
 def get_mac_for_ip(ip: str) -> str:
-    """Look up the MAC address for a given IP in the OS ARP cache."""
+    """Look up the MAC address for a given IP in the OS ARP cache or local machine."""
     if not ip or not is_valid_ipv4(ip):
         return ""
+    if ip == get_local_ip() or ip.startswith("127."):
+        local_mac = get_local_mac(ip if not ip.startswith("127.") else None)
+        if local_mac:
+            return local_mac
     cmd = ["arp", "-an"] if platform.system() in ("Darwin", "Linux") else ["arp", "-a"]
     try:
         out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
@@ -152,10 +263,15 @@ def get_mac_for_ip(ip: str) -> str:
 
 
 def get_ip_for_mac(mac: str) -> str:
-    """Look up the IP address for a given MAC in the OS ARP cache."""
+    """Look up the IP address for a given MAC in the OS ARP cache or local machine."""
     target_mac = normalize_mac(mac)
     if not target_mac:
         return ""
+    local_mac = get_local_mac()
+    if local_mac and local_mac == target_mac:
+        local_ip = get_local_ip()
+        if local_ip:
+            return local_ip
     cmd = ["arp", "-an"] if platform.system() in ("Darwin", "Linux") else ["arp", "-a"]
     try:
         out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)

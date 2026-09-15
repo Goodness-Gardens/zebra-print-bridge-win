@@ -24,6 +24,7 @@ from app.printer_manager import PrinterManager
 from app.server import PrintServer
 from app.utils import (
     get_local_ip,
+    get_local_mac,
     get_hostname,
     is_valid_target,
     is_valid_ipv4,
@@ -167,11 +168,14 @@ class PrintBridge:
         self._record_runtime_event("queue_thread_started")
 
         local_ip = get_local_ip()
+        local_mac = get_local_mac(local_ip)
         self.logger.info("=" * 50)
         self.logger.info("Service initialized and listening for requests.")
         self.logger.info(f"  Local URL:   http://localhost:{self.config.port}")
         if local_ip:
             self.logger.info(f"  Network URL: http://{local_ip}:{self.config.port}")
+        if local_mac:
+            self.logger.info(f"  Network MAC: {local_mac}")
         self.logger.info(f"  Test UI:     http://{local_ip or 'localhost'}:{self.config.port}/test-client")
         self.logger.info("=" * 50)
 
@@ -739,11 +743,13 @@ class PrintBridge:
         ]
 
         server_hostname = get_hostname()
+        server_mac = get_local_mac()
         return {
             "server_running": self.running,
             "mode": "raw_printing",
             "server_hostname": server_hostname,
             "hostname": server_hostname,
+            "server_mac": server_mac,
             "pending_jobs": stats_copy["pending"],
             "completed_jobs": stats_copy["completed"],
             "failed_jobs": stats_copy["failed"],

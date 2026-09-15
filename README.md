@@ -178,6 +178,10 @@ Server info including network address and required fields.
   "local_url": "http://localhost:5050",
   "network_url": "http://192.168.1.100:5050",
   "network_ip": "192.168.1.100",
+  "server_mac": "00:07:4D:6F:C2:14",
+  "network_mac": "00:07:4D:6F:C2:14",
+  "mac_address": "00:07:4D:6F:C2:14",
+  "mac": "00:07:4D:6F:C2:14",
   "platform": "Windows 10",
   "uptime": "2h 15m 30s",
   "required_fields": {

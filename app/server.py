@@ -20,6 +20,7 @@ from . import __version__
 from .config import get_platform_info
 from .utils import (
     get_local_ip,
+    get_local_mac,
     get_hostname,
     is_valid_target,
     normalize_target,
@@ -170,10 +171,12 @@ class PrintServer:
             """Get current server status and queue metrics."""
             self._record_usage("status_requested", log=False)
             server_hostname = get_hostname()
+            server_mac = self._get_local_mac()
             if self.on_status_request:
                 status = self.on_status_request()
                 status["server_hostname"] = server_hostname
                 status["hostname"] = server_hostname
+                status["server_mac"] = server_mac
                 status["uptime"] = self._get_uptime()
                 status["usage"] = self._get_usage_snapshot()
                 return status
@@ -181,6 +184,7 @@ class PrintServer:
                 "status": "running",
                 "server_hostname": server_hostname,
                 "hostname": server_hostname,
+                "server_mac": server_mac,
                 "uptime": self._get_uptime(),
                 "usage": self._get_usage_snapshot(),
             }
@@ -192,9 +196,10 @@ class PrintServer:
 
         @app.get("/info")
         async def get_info():
-            """Get server info including network IP for remote access."""
+            """Get server info including network IP and MAC for remote access."""
             self._record_usage("info_requested")
             local_ip = self._get_local_ip()
+            local_mac = self._get_local_mac(local_ip)
             platform_info = get_platform_info()
             server_hostname = get_hostname()
 
@@ -208,6 +213,10 @@ class PrintServer:
                 "server_port": self.port,
                 "server_ip": local_ip,
                 "network_ip": local_ip,
+                "server_mac": local_mac,
+                "network_mac": local_mac,
+                "mac_address": local_mac,
+                "mac": local_mac,
                 "server_url": f"{local_ip}:{self.port}" if local_ip else f"localhost:{self.port}",
                 "server_url_host": f"{server_hostname}:{self.port}",
                 "local_url": f"http://localhost:{self.port}",
@@ -810,6 +819,15 @@ class PrintServer:
         else:
             self._record_usage("local_ip_lookup_failed")
         return ip
+
+    def _get_local_mac(self, ip: Optional[str] = None) -> Optional[str]:
+        """Get the local network MAC address."""
+        mac = get_local_mac(ip)
+        if mac:
+            self._record_usage("local_mac_lookup_succeeded", mac=mac)
+        else:
+            self._record_usage("local_mac_lookup_failed")
+        return mac
 
     def _get_uptime(self) -> str:
         """Get server uptime as a human-readable string."""
