@@ -1,0 +1,3 @@
+# Zebra Print Bridge - Development Dependencies
+pytest>=8.0.0
+httpx>=0.24.0

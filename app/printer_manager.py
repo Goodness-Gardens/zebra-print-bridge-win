@@ -85,6 +85,25 @@ def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> st
     return ""
 
 
+def get_identity_key(mac: Optional[str] = None, serial: Optional[str] = None, ip: Optional[str] = None) -> str:
+    """
+    Generate cache identity key:
+    1. Normalized MAC ('AA:BB:CC:DD:EE:FF') if present
+    2. 'serial:<serial>' if serial present
+    3. 'ip:<ip>' if only IP present
+    """
+    norm_mac = normalize_mac(mac) if mac else None
+    if norm_mac:
+        return norm_mac
+    clean_serial = (serial or "").strip()
+    if clean_serial:
+        return f"serial:{clean_serial}"
+    clean_ip = (ip or "").strip()
+    if clean_ip:
+        return f"ip:{clean_ip}"
+    return ""
+
+
 def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     """
     Probe a network IP for printer availability without sending any print payload.
@@ -142,6 +161,7 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
 
     # 4. Resolve MAC address via OS ARP table (instant, safe)
     mac_address = get_mac_for_ip(ip)
+    mac_source = "arp" if mac_address else None
 
     # 5. Fallback to SNMP sysName / Zebra Enterprise MIB on UDP port 161
     unique_id = ""
@@ -166,8 +186,11 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
         "hostname": hostname,
         "ip": ip,
         "port": 9100,
-        "unique_id": unique_id,
-        "mac_address": mac_address,
+        "mac": mac_address or None,
+        "mac_address": mac_address or "",
+        "serial": unique_id or None,
+        "unique_id": unique_id or "",
+        "mac_source": mac_source,
         "last_seen": datetime.now().isoformat(),
     }
 
@@ -297,44 +320,196 @@ class PrinterManager:
         return True, None
 
     def _load_cache(self):
-        """Load persistent discovered printers from disk."""
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, "r") as f:
-                    data = json.load(f)
-                printers = data.get("printers", {})
-                if isinstance(printers, list):
-                    printers = {p["ip"]: p for p in printers if "ip" in p}
-                with self._lock:
-                    self._network_printers = printers
-                    self._rebuild_alias_map_locked()
-                logger.info("Loaded %d persistent network printers from %s", len(printers), self.cache_file)
-            except Exception as e:
-                logger.warning("Failed to load network printers cache: %s", e)
+        """Load persistent discovered printers from disk with automatic v1 to v2 migration."""
+        if not self.cache_file.exists():
+            return
+
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            printers = {}
+            needs_save = False
+
+            if data.get("version") == 2 and isinstance(data.get("printers"), dict):
+                for k, p in data["printers"].items():
+                    mac = normalize_mac(p.get("mac") or p.get("mac_address"))
+                    serial = (p.get("serial") or p.get("unique_id") or "").strip() or None
+                    ip = p.get("ip")
+                    key = get_identity_key(mac, serial, ip) or k
+                    printers[key] = {
+                        "mac": mac,
+                        "serial": serial,
+                        "ip": ip,
+                        "port": int(p.get("port", self.DEFAULT_PORT)),
+                        "name": p.get("name", ""),
+                        "hostname": p.get("hostname", ""),
+                        "last_seen": p.get("last_seen") or datetime.now().isoformat(),
+                        "mac_source": p.get("mac_source"),
+                        "mac_address": mac or "",
+                        "unique_id": serial or "",
+                    }
+            else:
+                # Automatic migration from v1 (unversioned, keyed by IP or list)
+                raw_printers = data.get("printers", {})
+                if isinstance(raw_printers, list):
+                    items = raw_printers
+                elif isinstance(raw_printers, dict):
+                    items = list(raw_printers.values())
+                else:
+                    items = []
+
+                for p in items:
+                    mac = normalize_mac(p.get("mac_address") or p.get("mac"))
+                    serial = (p.get("unique_id") or p.get("serial") or "").strip() or None
+                    ip = p.get("ip")
+                    key = get_identity_key(mac, serial, ip)
+                    if not key:
+                        continue
+                    printers[key] = {
+                        "mac": mac,
+                        "serial": serial,
+                        "ip": ip,
+                        "port": int(p.get("port", self.DEFAULT_PORT)),
+                        "name": p.get("name", ""),
+                        "hostname": p.get("hostname", ""),
+                        "last_seen": p.get("last_seen") or datetime.now().isoformat(),
+                        "mac_source": "arp" if mac else None,
+                        "mac_address": mac or "",
+                        "unique_id": serial or "",
+                    }
+                needs_save = True
+                logger.info("Migrated %d printers from cache v1 to v2 identity format", len(printers))
+
+            with self._lock:
+                self._network_printers = printers
+                self._rebuild_alias_map_locked()
+
+            if needs_save and printers:
+                self._save_cache()
+
+            logger.info("Loaded %d persistent network printers from %s (v2)", len(printers), self.cache_file)
+        except Exception as e:
+            logger.warning("Failed to load network printers cache: %s", e)
 
     def _save_cache(self):
-        """Save discovered printers to disk persistently."""
+        """Save discovered printers to disk persistently in v2 format."""
         try:
             with self._lock:
                 data = {
+                    "version": 2,
                     "updated_at": datetime.now().isoformat(),
-                    "printers": dict(self._network_printers)
+                    "printers": dict(self._network_printers),
                 }
-            with open(self.cache_file, "w") as f:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            logger.debug("Saved network printers cache to %s", self.cache_file)
+            logger.debug("Saved network printers cache (v2) to %s", self.cache_file)
         except Exception as e:
             logger.warning("Failed to save network printers cache: %s", e)
+
+    def _update_or_add_printer_locked(self, p: Dict) -> Tuple[bool, str]:
+        """
+        Add or update a printer entry in self._network_printers indexed by identity.
+        Returns (changed: bool, identity_key: str).
+        - Never creates duplicates for the same MAC or serial.
+        - If another device held the new IP, its IP is cleared.
+        """
+        mac = normalize_mac(p.get("mac") or p.get("mac_address"))
+        serial = (p.get("serial") or p.get("unique_id") or "").strip() or None
+        ip = p.get("ip")
+        port = int(p.get("port", self.DEFAULT_PORT))
+        name = (p.get("name") or "").strip()
+        hostname = (p.get("hostname") or "").strip()
+        last_seen = p.get("last_seen") or datetime.now().isoformat()
+        mac_source = p.get("mac_source")
+
+        # 1. Look for existing entry matching MAC, then serial, then IP-only key
+        matched_key = None
+        if mac and mac in self._network_printers:
+            matched_key = mac
+        elif serial:
+            for k, existing in self._network_printers.items():
+                if existing.get("serial") and existing["serial"] == serial:
+                    matched_key = k
+                    break
+        if not matched_key and ip:
+            ip_key = f"ip:{ip}"
+            if ip_key in self._network_printers:
+                matched_key = ip_key
+
+        # 2. Detect IP conflict: another entry currently has this IP
+        if ip:
+            stale_keys = []
+            for k, existing in list(self._network_printers.items()):
+                if k != matched_key and existing.get("ip") == ip:
+                    logger.warning(
+                        "IP %s was reassigned: moving from device '%s' to '%s'",
+                        ip, k, mac or (f"serial:{serial}" if serial else ip)
+                    )
+                    if k.startswith("ip:"):
+                        stale_keys.append(k)
+                    else:
+                        existing["ip"] = None
+            for k in stale_keys:
+                del self._network_printers[k]
+
+        # 3. Determine canonical identity key for this device
+        new_key = get_identity_key(mac, serial, ip)
+        if not new_key:
+            return False, ""
+
+        # 4. If matched under an older/weaker key (e.g. was serial:123 or ip:1.2.3.4, and now we have MAC)
+        existing_entry = self._network_printers.get(matched_key) if matched_key else None
+        if matched_key and matched_key != new_key:
+            del self._network_printers[matched_key]
+            if existing_entry:
+                if not name and existing_entry.get("name"):
+                    name = existing_entry["name"]
+                if not hostname and existing_entry.get("hostname"):
+                    hostname = existing_entry["hostname"]
+                if not serial and existing_entry.get("serial"):
+                    serial = existing_entry["serial"]
+
+        entry = {
+            "mac": mac or (existing_entry.get("mac") if existing_entry else None),
+            "serial": serial or (existing_entry.get("serial") if existing_entry else None),
+            "ip": ip,
+            "port": port,
+            "name": name or (existing_entry.get("name") if existing_entry else "") or (f"Zebra Printer ({ip})" if ip else "Zebra Printer"),
+            "hostname": hostname or (existing_entry.get("hostname") if existing_entry else ""),
+            "last_seen": last_seen,
+            "mac_source": mac_source or (existing_entry.get("mac_source") if existing_entry else None),
+            "mac_address": mac or (existing_entry.get("mac_address") if existing_entry else "") or "",
+            "unique_id": serial or (existing_entry.get("unique_id") if existing_entry else "") or "",
+        }
+
+        changed = True
+        if existing_entry:
+            if (existing_entry.get("ip") == entry["ip"] and
+                existing_entry.get("name") == entry["name"] and
+                existing_entry.get("serial") == entry["serial"] and
+                existing_entry.get("mac") == entry["mac"] and
+                matched_key == new_key):
+                changed = False
+
+        self._network_printers[new_key] = entry
+        return changed, new_key
 
     def _rebuild_alias_map_locked(self):
         """Rebuild fast alias lookup map from discovered printers and saved_printers."""
         mapping = {}
 
-        # 1. Discovered printers
-        for ip, p in self._network_printers.items():
-            name = p.get("name", "").strip()
-            host = p.get("hostname", "").strip()
-            uid = p.get("unique_id", "").strip()
+        # 1. Discovered printers (only entries with active IP)
+        for key, p in self._network_printers.items():
+            ip = p.get("ip")
+            if not ip:
+                continue
+
+            name = (p.get("name") or "").strip()
+            host = (p.get("hostname") or "").strip()
+            serial = (p.get("serial") or p.get("unique_id") or "").strip()
+            mac = (p.get("mac") or p.get("mac_address") or "").strip()
+
             if name:
                 name_lower = name.lower()
                 mapping[name_lower] = ip
@@ -346,21 +521,25 @@ class PrinterManager:
                     prefixed = f"nh-{name_lower}"
                     if prefixed not in mapping:
                         mapping[prefixed] = ip
+
             if host:
                 host_lower = host.lower()
                 mapping[host_lower] = ip
                 clean_host = host_lower.split(".")[0]
                 if clean_host not in mapping:
                     mapping[clean_host] = ip
-            if uid:
-                mapping[uid.lower()] = ip
-            mac = p.get("mac_address", "").strip()
+
+            if serial:
+                mapping[serial.lower()] = ip
+                mapping[f"serial:{serial.lower()}"] = ip
+
             if mac:
                 norm_mac = normalize_mac(mac)
                 if norm_mac:
-                    mapping[norm_mac.lower()] = ip
-                    mapping[norm_mac.lower().replace(":", "")] = ip
-                    mapping[norm_mac.lower().replace(":", "-")] = ip
+                    norm_lower = norm_mac.lower()
+                    mapping[norm_lower] = ip
+                    mapping[norm_lower.replace(":", "")] = ip
+                    mapping[norm_lower.replace(":", "-")] = ip
 
         # 2. User-defined saved_printers from config
         for p in self.saved_printers:
@@ -390,12 +569,14 @@ class PrinterManager:
     def refresh_known_printers(self, prune_unreachable: bool = True) -> bool:
         """
         Quickly poll all currently known printer IPs (<100ms) to detect renames,
-        updates, and optionally prune offline/unreachable printers.
+        updates, and detect if an IP moved to another device or is offline.
         Returns True if any changes occurred.
         """
         known_ips = set()
         with self._lock:
-            known_ips.update(self._network_printers.keys())
+            for p in self._network_printers.values():
+                if p.get("ip"):
+                    known_ips.add(p["ip"])
             for p in self.saved_printers:
                 if p.get("ip"):
                     known_ips.add(p["ip"])
@@ -413,9 +594,8 @@ class PrinterManager:
                     res = fut.result()
                     if res:
                         with self._lock:
-                            existing = self._network_printers.get(ip)
-                            if not existing or existing.get("name") != res.get("name") or existing.get("unique_id") != res.get("unique_id"):
-                                self._network_printers[ip] = res
+                            entry_changed, _ = self._update_or_add_printer_locked(res)
+                            if entry_changed:
                                 changed = True
                     else:
                         unreachable_ips.add(ip)
@@ -425,9 +605,16 @@ class PrinterManager:
         if prune_unreachable and unreachable_ips:
             with self._lock:
                 for ip in unreachable_ips:
-                    if ip in self._network_printers:
-                        del self._network_printers[ip]
-                        changed = True
+                    stale_keys = []
+                    for k, p in self._network_printers.items():
+                        if p.get("ip") == ip:
+                            if k.startswith("ip:"):
+                                stale_keys.append(k)
+                            else:
+                                p["ip"] = None
+                            changed = True
+                    for k in stale_keys:
+                        del self._network_printers[k]
 
         if changed:
             with self._lock:
@@ -439,7 +626,7 @@ class PrinterManager:
                     self.cache_file.unlink()
                 except Exception:
                     pass
-            logger.info("Updated printer aliases from network: %s", {p["name"]: p["ip"] for p in self._network_printers.values()})
+            logger.info("Updated printer aliases from network: %s", {p.get("name", "Zebra"): p.get("ip") for p in self._network_printers.values() if p.get("ip")})
 
         return changed
 
@@ -472,14 +659,14 @@ class PrinterManager:
 
         with self._lock:
             if clear_cache:
-                self._network_printers = discovered
-            else:
-                self._network_printers.update(discovered)
+                self._network_printers.clear()
+            for p in discovered.values():
+                self._update_or_add_printer_locked(p)
             self._rebuild_alias_map_locked()
 
         if self._network_printers:
             self._save_cache()
-            logger.info("Discovered %d Zebra printers on network: %s", len(discovered), [p["name"] for p in discovered.values()])
+            logger.info("Discovered %d Zebra printers on network: %s", len(discovered), [p.get("name") for p in discovered.values()])
         elif clear_cache and self.cache_file.exists():
             try:
                 self.cache_file.unlink()
@@ -785,16 +972,23 @@ class PrinterManager:
         with self._lock:
             printers = []
             for p in self._network_printers.values():
+                ip = p.get("ip")
+                mac = p.get("mac") or p.get("mac_address", "")
+                serial = p.get("serial") or p.get("unique_id", "")
                 printers.append({
                     "name": p.get("name", "Zebra Network Printer"),
                     "type": "network",
                     "hostname": p.get("hostname", ""),
-                    "address": p.get("ip"),
-                    "ip": p.get("ip"),
+                    "address": ip,
+                    "ip": ip,
                     "port": p.get("port", self.DEFAULT_PORT),
-                    "status": "ready",
-                    "unique_id": p.get("unique_id", ""),
-                    "mac_address": p.get("mac_address", ""),
+                    "status": "ready" if ip else "offline",
+                    "unique_id": serial,
+                    "serial": serial,
+                    "mac_address": mac,
+                    "mac": mac,
+                    "mac_source": p.get("mac_source"),
+                    "last_seen": p.get("last_seen"),
                 })
             # Sort by name
             printers.sort(key=lambda x: x["name"])
