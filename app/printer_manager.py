@@ -40,30 +40,53 @@ if platform.system() == "Windows":
 logger = logging.getLogger(__name__)
 
 
-def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> str:
-    """Query an SNMPv1/v2c OID on UDP port 161 (100% passive to port 9100, zero print bytes)."""
+def _parse_ber_length(data: bytes, offset: int) -> Tuple[int, int]:
+    """
+    Parse ASN.1 BER length starting at data[offset].
+    Returns (length, new_offset_after_length_bytes).
+    """
+    if offset >= len(data):
+        return 0, offset
+    first = data[offset]
+    if (first & 0x80) == 0:
+        return first, offset + 1
+    num_bytes = first & 0x7F
+    if num_bytes == 0 or offset + 1 + num_bytes > len(data):
+        return 0, offset + 1
+    val = 0
+    for b in data[offset + 1 : offset + 1 + num_bytes]:
+        val = (val << 8) | b
+    return val, offset + 1 + num_bytes
+
+
+def _build_snmp_packet(oid_list: List[int], pdu_type: int = 0xA0) -> bytes:
+    """Build SNMPv1 packet for a given OID (0xA0 = GetRequest, 0xA1 = GetNextRequest)."""
+    oid_bytes = bytearray([oid_list[0] * 40 + oid_list[1]])
+    for val in oid_list[2:]:
+        if val < 128:
+            oid_bytes.append(val)
+        else:
+            parts = []
+            while val > 0:
+                parts.append(val & 0x7F)
+                val >>= 7
+            for i in range(len(parts) - 1, 0, -1):
+                oid_bytes.append(parts[i] | 0x80)
+            oid_bytes.append(parts[0])
+
+    comm_bytes = b"public"
+    varbind = b"\x30" + bytes([len(oid_bytes) + 4]) + b"\x06" + bytes([len(oid_bytes)]) + bytes(oid_bytes) + b"\x05\x00"
+    varbind_list = b"\x30" + bytes([len(varbind)]) + varbind
+    pdu_payload = b"\x02\x01\x01\x02\x01\x00\x02\x01\x00" + varbind_list
+    pdu = bytes([pdu_type]) + bytes([len(pdu_payload)]) + pdu_payload
+    msg_payload = b"\x02\x01\x00\x04" + bytes([len(comm_bytes)]) + comm_bytes + pdu
+    return b"\x30" + bytes([len(msg_payload)]) + msg_payload
+
+
+def _query_snmp_raw(ip: str, oid_list: List[int], timeout: float = 0.3, pdu_type: int = 0xA0) -> Optional[bytes]:
+    """Query an SNMPv1 OID on UDP port 161 and return the raw byte payload of the OCTET STRING varbind."""
     try:
-        oid_bytes = bytearray([oid_list[0] * 40 + oid_list[1]])
-        for val in oid_list[2:]:
-            if val < 128:
-                oid_bytes.append(val)
-            else:
-                parts = []
-                while val > 0:
-                    parts.append(val & 0x7F)
-                    val >>= 7
-                for i in range(len(parts) - 1, 0, -1):
-                    oid_bytes.append(parts[i] | 0x80)
-                oid_bytes.append(parts[0])
-
-        comm_bytes = b"public"
-        varbind = b"\x30" + bytes([len(oid_bytes) + 4]) + b"\x06" + bytes([len(oid_bytes)]) + bytes(oid_bytes) + b"\x05\x00"
-        varbind_list = b"\x30" + bytes([len(varbind)]) + varbind
-        pdu_payload = b"\x02\x01\x01\x02\x01\x00\x02\x01\x00" + varbind_list
-        pdu = b"\xa0" + bytes([len(pdu_payload)]) + pdu_payload
-        msg_payload = b"\x02\x01\x00\x04" + bytes([len(comm_bytes)]) + comm_bytes + pdu
-        pkt = b"\x30" + bytes([len(msg_payload)]) + msg_payload
-
+        pkt = _build_snmp_packet(oid_list, pdu_type=pdu_type)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
         try:
@@ -73,16 +96,63 @@ def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> st
             if pdu_idx != -1:
                 oid_idx = data.find(b"\x06", pdu_idx)
                 if oid_idx != -1:
-                    oid_len = data[oid_idx + 1]
-                    val_idx = oid_idx + 2 + oid_len
-                    if val_idx < len(data) and data[val_idx] == 0x04:
-                        val_len = data[val_idx + 1]
-                        return data[val_idx + 2 : val_idx + 2 + val_len].decode("utf-8", errors="ignore").strip()
+                    oid_len, val_start = _parse_ber_length(data, oid_idx + 1)
+                    val_idx = val_start + oid_len
+                    if val_idx < len(data) and data[val_idx] == 0x04:  # OCTET STRING
+                        val_len, content_start = _parse_ber_length(data, val_idx + 1)
+                        if content_start + val_len <= len(data):
+                            return data[content_start : content_start + val_len]
         finally:
             s.close()
     except Exception:
         pass
+    return None
+
+
+def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> str:
+    """Query an SNMPv1/v2c OID on UDP port 161 (100% passive to port 9100, zero print bytes)."""
+    raw = _query_snmp_raw(ip, oid_list, timeout=timeout, pdu_type=0xA0)
+    if raw:
+        return raw.decode("utf-8", errors="ignore").strip()
     return ""
+
+
+def _format_mac_bytes(raw_mac: bytes) -> Optional[str]:
+    """Validate and format 6 raw MAC bytes into standard uppercase 'AA:BB:CC:DD:EE:FF'."""
+    if not raw_mac or len(raw_mac) != 6:
+        return None
+    # Discard if all zeros (00:00:00:00:00:00)
+    if not any(b != 0 for b in raw_mac):
+        return None
+    return ":".join(f"{b:02X}" for b in raw_mac)
+
+
+def _query_snmp_mac(ip: str, timeout: float = 0.3) -> Optional[str]:
+    """
+    Query interface physical MAC address (ifPhysAddress) via SNMP UDP port 161.
+    Tries:
+    1. GETNEXT on 1.3.6.1.2.1.2.2.1.6 (PDU 0xA1)
+    2. GET on ifIndex 1..4 (1.3.6.1.2.1.2.2.1.6.1 .. 4)
+    Returns first valid 6-byte non-zero MAC formatted as 'AA:BB:CC:DD:EE:FF', or None.
+    """
+    if_phys_base = [1, 3, 6, 1, 2, 1, 2, 2, 1, 6]
+
+    # 1. Try GETNEXT on base table
+    raw_next = _query_snmp_raw(ip, if_phys_base, timeout=timeout, pdu_type=0xA1)
+    if raw_next:
+        formatted = _format_mac_bytes(raw_next)
+        if formatted:
+            return formatted
+
+    # 2. Try GET on ifIndex 1 through 4
+    for idx in (1, 2, 3, 4):
+        raw = _query_snmp_raw(ip, if_phys_base + [idx], timeout=timeout, pdu_type=0xA0)
+        if raw:
+            formatted = _format_mac_bytes(raw)
+            if formatted:
+                return formatted
+
+    return None
 
 
 def get_identity_key(mac: Optional[str] = None, serial: Optional[str] = None, ip: Optional[str] = None) -> str:
@@ -159,9 +229,21 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     except Exception:
         pass
 
-    # 4. Resolve MAC address via OS ARP table (instant, safe)
-    mac_address = get_mac_for_ip(ip)
-    mac_source = "arp" if mac_address else None
+    # 4. Resolve MAC address: SNMP ifPhysAddress > OS ARP table
+    mac_address = ""
+    mac_source = None
+
+    # Priority 1: SNMP ifPhysAddress (UDP 161, works across routers & VPNs)
+    snmp_mac = _query_snmp_mac(ip, timeout=0.3)
+    if snmp_mac:
+        mac_address = snmp_mac
+        mac_source = "snmp"
+    else:
+        # Priority 2: OS ARP table (local subnet fallback)
+        arp_mac = get_mac_for_ip(ip)
+        if arp_mac:
+            mac_address = arp_mac
+            mac_source = "arp"
 
     # 5. Fallback to SNMP sysName / Zebra Enterprise MIB on UDP port 161
     unique_id = ""
