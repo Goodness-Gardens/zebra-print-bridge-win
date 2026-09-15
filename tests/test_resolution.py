@@ -206,3 +206,20 @@ class TestPrintBridgeResolution(unittest.TestCase):
         self.assertTrue(res["success"])
         self.assertEqual(res["printer_type"], "test")
         self.assertIn("Test printer ready", res["message"])
+
+    def test_check_connection_cached_mac_single_verification(self):
+        mac = "00:11:22:33:44:55"
+        self.bridge.printer_manager._network_printers[mac] = {
+            "mac": mac,
+            "ip": "192.168.1.100",
+            "port": 9100,
+            "serial": "ZEB123",
+        }
+        with patch.object(self.bridge.printer_manager, "_check_port_open", return_value=True) as mock_port:
+            with patch.object(self.bridge.printer_manager, "verify_device_identity", return_value=(True, mac, "ZEB123")) as mock_verify:
+                res = self.bridge.check_connection(target=mac)
+                self.assertTrue(res["success"])
+                self.assertEqual(res["printer_ip"], "192.168.1.100")
+                mock_port.assert_called_once()
+                mock_verify.assert_called_once()
+

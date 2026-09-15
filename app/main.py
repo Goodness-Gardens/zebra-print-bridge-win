@@ -603,6 +603,27 @@ class PrintBridge:
             }
 
         if resolved.ip:
+            if resolved.reachable and resolved.verified:
+                latency_ms = round((perf_counter() - started_at) * 1000, 2)
+                self._record_runtime_event(
+                    "connection_check_completed",
+                    printer_ip=resolved.ip,
+                    printer_mac=resolved.mac,
+                    printer_type="network",
+                    success=True,
+                    latency_ms=latency_ms,
+                )
+                return {
+                    "success": True,
+                    "printer_ip": resolved.ip,
+                    "printer_mac": resolved.mac,
+                    "printer_type": "network",
+                    "message": resolved.message or f"Connected to {resolved.ip}:{resolved.port}",
+                    "latency_ms": latency_ms,
+                    "identity": getattr(resolved, "verification", "match"),
+                }
+
+            # Only call _test_network_connection when resolution did not verify (manual, alias, dns, mdns)
             success, message = self.printer_manager._test_network_connection(
                 resolved.ip,
                 resolved.port,
@@ -625,6 +646,7 @@ class PrintBridge:
                 "printer_type": "network",
                 "message": message,
                 "latency_ms": latency_ms,
+                "identity": getattr(resolved, "verification", None),
             }
 
         # Resolution failed
