@@ -127,3 +127,40 @@ def test_probe_zebra_printer_arp_fallback():
         assert res["mac_source"] == "arp"
         assert not mock_sock.send.called
         assert not mock_sock.sendall.called
+
+
+def test_snmp_timeout_aborts_after_first_query_and_caches():
+    import socket
+    from app.printer_manager import (
+        PrinterManager,
+        _clear_no_snmp_cache,
+        _is_ip_no_snmp,
+    )
+
+    _clear_no_snmp_cache()
+    test_ip = "192.168.1.77"
+    assert not _is_ip_no_snmp(test_ip)
+
+    pm = PrinterManager(scan_network=False)
+
+    with patch("socket.socket") as mock_sock_cls:
+        mock_sock = MagicMock()
+        mock_sock_cls.return_value = mock_sock
+        mock_sock.recvfrom.side_effect = socket.timeout("Timed out")
+
+        with patch("app.printer_manager.get_mac_for_ip", return_value=None):
+            pm.verify_device_identity(test_ip, expected_mac="00:11:22:33:44:55")
+
+        # INVARIANT: Exactly one SNMP UDP query was attempted
+        assert mock_sock.sendto.call_count == 1
+        # IP must now be cached as no-snmp
+        assert _is_ip_no_snmp(test_ip)
+
+        # Subsequent verification within TTL makes 0 queries
+        mock_sock.sendto.reset_mock()
+        with patch("app.printer_manager.get_mac_for_ip", return_value=None):
+            pm.verify_device_identity(test_ip, expected_mac="00:11:22:33:44:55")
+        assert mock_sock.sendto.call_count == 0
+
+    _clear_no_snmp_cache()
+

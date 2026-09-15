@@ -101,8 +101,38 @@ def _build_snmp_packet(oid_list: List[int], pdu_type: int = 0xA0) -> bytes:
     return b"\x30" + bytes([len(msg_payload)]) + msg_payload
 
 
+# In-memory cache for IPs confirmed to not respond to SNMP (10-minute TTL)
+_no_snmp_cache: Dict[str, float] = {}
+_no_snmp_lock = threading.Lock()
+
+
+def _is_ip_no_snmp(ip: str) -> bool:
+    """Check if IP is known to not respond to SNMP within TTL window."""
+    with _no_snmp_lock:
+        exp = _no_snmp_cache.get(ip)
+        if exp:
+            if time.time() < exp:
+                return True
+            _no_snmp_cache.pop(ip, None)
+    return False
+
+
+def _mark_ip_no_snmp(ip: str, ttl: float = 600.0) -> None:
+    """Mark an IP as non-responsive to SNMP for ttl seconds (default 10 minutes)."""
+    with _no_snmp_lock:
+        _no_snmp_cache[ip] = time.time() + ttl
+
+
+def _clear_no_snmp_cache() -> None:
+    """Clear the in-memory no-SNMP IP cache (primarily for tests)."""
+    with _no_snmp_lock:
+        _no_snmp_cache.clear()
+
+
 def _query_snmp_raw(ip: str, oid_list: List[int], timeout: float = 0.3, pdu_type: int = 0xA0) -> Optional[bytes]:
     """Query an SNMPv1 OID on UDP port 161 and return the raw byte payload of the OCTET STRING varbind."""
+    if _is_ip_no_snmp(ip):
+        return None
     try:
         pkt = _build_snmp_packet(oid_list, pdu_type=pdu_type)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -122,6 +152,8 @@ def _query_snmp_raw(ip: str, oid_list: List[int], timeout: float = 0.3, pdu_type
                             return data[content_start : content_start + val_len]
         finally:
             s.close()
+    except (socket.timeout, TimeoutError):
+        _mark_ip_no_snmp(ip)
     except Exception:
         pass
     return None
@@ -152,7 +184,11 @@ def _query_snmp_mac(ip: str, timeout: float = 0.3) -> Optional[str]:
     1. GETNEXT on 1.3.6.1.2.1.2.2.1.6 (PDU 0xA1)
     2. GET on ifIndex 1..4 (1.3.6.1.2.1.2.2.1.6.1 .. 4)
     Returns first valid 6-byte non-zero MAC formatted as 'AA:BB:CC:DD:EE:FF', or None.
+    If the first query times out without response, marks IP as no-snmp and aborts immediately.
     """
+    if _is_ip_no_snmp(ip):
+        return None
+
     if_phys_base = [1, 3, 6, 1, 2, 1, 2, 2, 1, 6]
 
     # 1. Try GETNEXT on base table
@@ -162,6 +198,10 @@ def _query_snmp_mac(ip: str, timeout: float = 0.3) -> Optional[str]:
         if formatted:
             return formatted
 
+    # If first query timed out or IP was marked no-snmp, do not perform subsequent queries
+    if _is_ip_no_snmp(ip):
+        return None
+
     # 2. Try GET on ifIndex 1 through 4
     for idx in (1, 2, 3, 4):
         raw = _query_snmp_raw(ip, if_phys_base + [idx], timeout=timeout, pdu_type=0xA0)
@@ -169,6 +209,8 @@ def _query_snmp_mac(ip: str, timeout: float = 0.3) -> Optional[str]:
             formatted = _format_mac_bytes(raw)
             if formatted:
                 return formatted
+        if _is_ip_no_snmp(ip):
+            return None
 
     return None
 
