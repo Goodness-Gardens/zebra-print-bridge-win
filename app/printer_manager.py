@@ -30,6 +30,7 @@ from .utils import (
     get_ip_for_mac,
     parse_target_address_port,
     normalize_target,
+    run_command,
 )
 
 
@@ -367,7 +368,7 @@ def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Ne
     subnets = []
     # Try ifconfig on macOS / Linux
     try:
-        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+        out = run_command(["ifconfig"])
         for line in out.splitlines():
             m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]+)", line)
             if m:
@@ -1442,12 +1443,18 @@ class PrinterManager:
             return False, "No printer name"
 
         try:
+            kwargs = {
+                "input": raw.encode("utf-8"),
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "timeout": 15,
+            }
+            if platform.system() == "Windows":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
             proc = subprocess.run(
                 ["lp", "-d", printer_name, "-o", "raw"],
-                input=raw.encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=15,
+                **kwargs
             )
             if proc.returncode == 0:
                 logger.info("Raw payload successfully sent to CUPS printer: '%s'.", printer_name)
@@ -1625,15 +1632,9 @@ class PrinterManager:
                 logger.debug("Failed to get Windows default printer name: %s", e)
         elif platform.system() in ("Darwin", "Linux"):
             try:
-                proc = subprocess.run(
-                    ["lpstat", "-d"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=5,
-                )
-                if proc.returncode == 0:
-                    match = re.search(r"system default destination:\s*(.+)", proc.stdout)
+                out = run_command(["lpstat", "-d"])
+                if out:
+                    match = re.search(r"system default destination:\s*(.+)", out)
                     if match:
                         return match.group(1).strip()
             except Exception as e:
@@ -1692,15 +1693,9 @@ class PrinterManager:
         printers_map = {}
         try:
             # Parse printer statuses from lpstat -p
-            p_proc = subprocess.run(
-                ["lpstat", "-p"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            if p_proc.returncode == 0:
-                for line in p_proc.stdout.splitlines():
+            p_out = run_command(["lpstat", "-p"])
+            if p_out:
+                for line in p_out.splitlines():
                     m = re.match(r"^printer\s+(\S+)\s+(.+)", line.strip())
                     if m:
                         name = m.group(1)
@@ -1725,15 +1720,9 @@ class PrinterManager:
                         }
 
             # Supplement with available printer destinations from lpstat -e
-            e_proc = subprocess.run(
-                ["lpstat", "-e"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            if e_proc.returncode == 0:
-                for dest in e_proc.stdout.splitlines():
+            e_out = run_command(["lpstat", "-e"])
+            if e_out:
+                for dest in e_out.splitlines():
                     dest = dest.strip()
                     if dest and dest not in printers_map:
                         printers_map[dest] = {
