@@ -76,6 +76,7 @@ class PrintBridge:
             printer_aliases=self.config.get("printer_aliases", {}),
             custom_subnets=self.config.custom_subnets,
             verify_identity=self.config.verify_identity,
+            strict_identity=self.config.strict_identity,
             cache_dir=self.config.config_dir,
         )
 
@@ -441,6 +442,16 @@ class PrintBridge:
 
         is_test = (resolved.source == "test" or resolved.ip == "test")
 
+        if not is_test and resolved.verification == "unverifiable" and getattr(self.config, "strict_identity", False):
+            msg = f"Identity unverifiable for printer target '{resolved.ip or resolved.mac}' and strict_identity is enabled"
+            self._record_runtime_event(
+                "job_rejected_strict_identity",
+                printer_ip=resolved.ip,
+                printer_mac=resolved.mac,
+                error=msg,
+            )
+            return {"success": False, "status_code": 503, "message": msg}
+
         if resolved.use_local:
             use_local = True
             resolved_target_ip = None
@@ -603,24 +614,25 @@ class PrintBridge:
             }
 
         if resolved.ip:
-            if resolved.reachable and resolved.verified:
+            if resolved.source in ("hint", "cache", "arp"):
                 latency_ms = round((perf_counter() - started_at) * 1000, 2)
+                success = resolved.reachable and not (getattr(self.config, "strict_identity", False) and resolved.verification == "unverifiable")
                 self._record_runtime_event(
                     "connection_check_completed",
                     printer_ip=resolved.ip,
                     printer_mac=resolved.mac,
                     printer_type="network",
-                    success=True,
+                    success=success,
                     latency_ms=latency_ms,
                 )
                 return {
-                    "success": True,
+                    "success": success,
                     "printer_ip": resolved.ip,
                     "printer_mac": resolved.mac,
                     "printer_type": "network",
                     "message": resolved.message or f"Connected to {resolved.ip}:{resolved.port}",
                     "latency_ms": latency_ms,
-                    "identity": getattr(resolved, "verification", "match"),
+                    "identity": resolved.verification,
                 }
 
             # Only call _test_network_connection when resolution did not verify (manual, alias, dns, mdns)

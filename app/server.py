@@ -66,6 +66,7 @@ class ConnectionCheckResponse(BaseModel):
     printer_type: str
     message: str
     latency_ms: Optional[float] = None
+    identity: Optional[str] = None
     server_hostname: Optional[str] = None
     hostname: Optional[str] = None  # Backward-compatible alias
 
@@ -362,6 +363,7 @@ class PrintServer:
                     printer_type=result.get("printer_type", "unknown"),
                     message=result.get("message", "Connection check completed"),
                     latency_ms=result.get("latency_ms"),
+                    identity=result.get("identity"),
                     server_hostname=server_hostname,
                     hostname=server_hostname,
                 )

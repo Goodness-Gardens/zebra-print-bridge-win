@@ -46,6 +46,9 @@ class ResolvedTarget:
     printer_name: Optional[str] = None
     use_local: bool = False
     verified: bool = False
+    verification: str = "unverifiable"  # "match", "mismatch", "unverifiable"
+    resolved: bool = True
+    host: Optional[str] = None
 
 # Conditional import for Windows printing
 _win32print = None
@@ -127,6 +130,28 @@ def _clear_no_snmp_cache() -> None:
     """Clear the in-memory no-SNMP IP cache (primarily for tests)."""
     with _no_snmp_lock:
         _no_snmp_cache.clear()
+
+
+# Set of IP addresses for which an identity unverifiable warning has already been logged
+_warned_unverifiable_ips: set = set()
+_warned_ips_lock = threading.Lock()
+
+
+def _log_unverifiable_once(ip: str) -> None:
+    """Log a warning once per IP when identity cannot be verified."""
+    with _warned_ips_lock:
+        if ip not in _warned_unverifiable_ips:
+            _warned_unverifiable_ips.add(ip)
+            logger.warning(
+                "Device at IP '%s' could not be verified (no SNMP/ARP response). Proceeding in fail-open mode.",
+                ip,
+            )
+
+
+def _clear_warned_unverifiable_ips() -> None:
+    """Clear the set of warned unverifiable IPs (for testing)."""
+    with _warned_ips_lock:
+        _warned_unverifiable_ips.clear()
 
 
 def _query_snmp_raw(ip: str, oid_list: List[int], timeout: float = 0.3, pdu_type: int = 0xA0) -> Optional[bytes]:
@@ -400,6 +425,7 @@ class PrinterManager:
         printer_aliases: Dict[str, str] = None,
         custom_subnets: List[str] = None,
         verify_identity: bool = True,
+        strict_identity: bool = False,
         cache_dir: Optional[Path] = None,
     ):
         self.scan_network = scan_network
@@ -408,6 +434,7 @@ class PrinterManager:
         self.printer_aliases = {k.lower(): v for k, v in (printer_aliases or {}).items()}
         self.custom_subnets = custom_subnets or ["192.168.0.0/22"]
         self.verify_identity = verify_identity
+        self.strict_identity = strict_identity
 
         # Persistent printer cache directory and file
         if cache_dir is not None:
@@ -882,13 +909,13 @@ class PrinterManager:
         expected_mac: Optional[str] = None,
         expected_serial: Optional[str] = None,
         timeout: float = 0.3,
-    ) -> Tuple[bool, Optional[str], Optional[str]]:
+    ) -> Tuple[str, Optional[str], Optional[str]]:
         """
         Verify that the device responding at `ip` matches expected MAC and/or serial.
-        Returns (matches: bool, detected_mac: Optional[str], detected_serial: Optional[str]).
-        - If expected MAC/serial matches detected: True.
-        - If detected MAC/serial contradicts expected: False.
-        - If device does not answer SNMP/ARP (no contradiction possible): True.
+        Returns (verification: str, detected_mac: Optional[str], detected_serial: Optional[str]).
+        - "match": expected MAC and/or serial matches detected device identity.
+        - "mismatch": detected MAC and/or serial contradicts expected identity.
+        - "unverifiable": device does not answer SNMP/ARP or no identity could be confirmed.
         """
         detected_mac = None
         detected_serial = None
@@ -916,7 +943,7 @@ class PrinterManager:
                     "Identity verification failed at %s: expected serial '%s', detected '%s'",
                     ip, expected_serial, detected_serial
                 )
-                return False, detected_mac, detected_serial
+                return "mismatch", detected_mac, detected_serial
 
         # Validate against expected MAC if provided
         if expected_mac and detected_mac:
@@ -927,9 +954,17 @@ class PrinterManager:
                     "Identity verification failed at %s: expected MAC '%s', detected '%s'",
                     ip, norm_exp, norm_det
                 )
-                return False, detected_mac, detected_serial
+                return "mismatch", detected_mac, detected_serial
 
-        return True, detected_mac, detected_serial
+        # Check if matched
+        matched_mac = bool(expected_mac and detected_mac and normalize_mac(expected_mac) == normalize_mac(detected_mac))
+        matched_serial = bool(expected_serial and detected_serial and expected_serial.strip().lower() == detected_serial.strip().lower())
+
+        if matched_mac or matched_serial:
+            return "match", detected_mac, detected_serial
+
+        # No contradiction, but identity could not be verified
+        return "unverifiable", detected_mac, detected_serial
 
     def resolve_target(
         self,
@@ -983,12 +1018,12 @@ class PrinterManager:
             # M5: If printer_ip was passed alongside printer_mac, use as hint
             if hint_ip:
                 if self._check_port_open(hint_ip, hint_port, timeout=min(self.network_timeout, 1.0)):
-                    matched = True
+                    verification = "unverifiable"
                     det_mac = None
                     det_serial = None
                     if self.verify_identity:
-                        matched, det_mac, det_serial = self.verify_device_identity(hint_ip, expected_mac=norm_mac)
-                    if matched and (det_mac == norm_mac or not det_mac):
+                        verification, det_mac, det_serial = self.verify_device_identity(hint_ip, expected_mac=norm_mac)
+                    if verification == "match":
                         logger.info("Hint IP '%s' verified for MAC '%s'", hint_ip, norm_mac)
                         with self._lock:
                             self._update_or_add_printer_locked({
@@ -1007,8 +1042,32 @@ class PrinterManager:
                             port=hint_port,
                             source="hint",
                             reachable=True,
-                            verified=matched,
+                            verified=True,
+                            verification="match",
                             message=f"Resolved via verified hint IP {hint_ip}",
+                        )
+                    elif verification == "unverifiable":
+                        _log_unverifiable_once(hint_ip)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": hint_ip,
+                                "port": hint_port,
+                                "mac_source": "hint",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=hint_ip,
+                            port=hint_port,
+                            source="hint",
+                            reachable=True,
+                            verified=False,
+                            verification="unverifiable",
+                            message=f"Resolved via hint IP {hint_ip} (identity unverifiable)",
                         )
                     else:
                         logger.warning(
@@ -1032,12 +1091,12 @@ class PrinterManager:
             if cached_ip and is_valid_ipv4(cached_ip):
                 if self._check_port_open(cached_ip, cached_port, timeout=min(self.network_timeout, 1.0)):
                     if self.verify_identity:
-                        matched, det_mac, det_serial = self.verify_device_identity(
+                        verification, det_mac, det_serial = self.verify_device_identity(
                             cached_ip,
                             expected_mac=norm_mac,
                             expected_serial=cached_serial,
                         )
-                        if matched:
+                        if verification == "match":
                             return ResolvedTarget(
                                 mac=norm_mac,
                                 serial=det_serial or cached_serial,
@@ -1046,7 +1105,21 @@ class PrinterManager:
                                 source="cache",
                                 reachable=True,
                                 verified=True,
+                                verification="match",
                                 message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip}",
+                            )
+                        elif verification == "unverifiable":
+                            _log_unverifiable_once(cached_ip)
+                            return ResolvedTarget(
+                                mac=norm_mac,
+                                serial=det_serial or cached_serial,
+                                ip=cached_ip,
+                                port=cached_port,
+                                source="cache",
+                                reachable=True,
+                                verified=False,
+                                verification="unverifiable",
+                                message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip} (identity unverifiable)",
                             )
                         else:
                             logger.warning(
@@ -1067,6 +1140,7 @@ class PrinterManager:
                             source="cache",
                             reachable=True,
                             verified=False,
+                            verification="unverifiable",
                             message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip}",
                         )
                 else:
@@ -1081,11 +1155,12 @@ class PrinterManager:
             arp_ip = get_ip_for_mac(norm_mac)
             if arp_ip and is_valid_ipv4(arp_ip):
                 if self._check_port_open(arp_ip, self.DEFAULT_PORT, timeout=min(self.network_timeout, 1.0)):
-                    matched = True
+                    verification = "unverifiable"
+                    det_mac = None
                     det_serial = None
                     if self.verify_identity:
-                        matched, det_mac, det_serial = self.verify_device_identity(arp_ip, expected_mac=norm_mac)
-                    if matched:
+                        verification, det_mac, det_serial = self.verify_device_identity(arp_ip, expected_mac=norm_mac)
+                    if verification == "match":
                         logger.info("Resolved MAC '%s' from OS ARP table -> %s", norm_mac, arp_ip)
                         with self._lock:
                             self._update_or_add_printer_locked({
@@ -1104,8 +1179,32 @@ class PrinterManager:
                             port=self.DEFAULT_PORT,
                             source="arp",
                             reachable=True,
-                            verified=matched,
+                            verified=True,
+                            verification="match",
                             message=f"Resolved MAC '{norm_mac}' from ARP table -> {arp_ip}",
+                        )
+                    elif verification == "unverifiable":
+                        _log_unverifiable_once(arp_ip)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": arp_ip,
+                                "port": self.DEFAULT_PORT,
+                                "mac_source": "arp",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=arp_ip,
+                            port=self.DEFAULT_PORT,
+                            source="arp",
+                            reachable=True,
+                            verified=False,
+                            verification="unverifiable",
+                            message=f"Resolved MAC '{norm_mac}' from ARP table -> {arp_ip} (identity unverifiable)",
                         )
 
             # Subnet scan (serialized with _scan_lock, max once per request)
@@ -1414,12 +1513,12 @@ class PrinterManager:
                 if result == 0:
                     # M4: Verify device identity if requested
                     if self.verify_identity and (expected_mac or expected_serial):
-                        matched, det_mac, det_serial = self.verify_device_identity(
+                        verification, det_mac, det_serial = self.verify_device_identity(
                             resolved_address,
                             expected_mac=expected_mac,
                             expected_serial=expected_serial,
                         )
-                        if not matched:
+                        if verification == "mismatch":
                             with self._lock:
                                 if expected_mac and expected_mac in self._network_printers:
                                     self._network_printers[expected_mac]["ip"] = None
@@ -1427,6 +1526,8 @@ class PrinterManager:
                             det_id = det_mac or det_serial or "unknown"
                             exp_id = expected_mac or expected_serial
                             return False, f"Identity verification failed: device at {resolved_address} ({det_id}) does not match expected {exp_id}"
+                        elif verification == "unverifiable":
+                            _log_unverifiable_once(resolved_address)
 
                     return True, f"Connected to {display}"
                 return False, f"Cannot connect to printer at {display}"

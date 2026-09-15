@@ -33,10 +33,11 @@ class TestResolution(unittest.TestCase):
         }
 
         with patch.object(self.pm, "_check_port_open", return_value=True):
-            with patch.object(self.pm, "verify_device_identity", return_value=(True, mac, "ZEB123")):
+            with patch.object(self.pm, "verify_device_identity", return_value=("match", mac, "ZEB123")):
                 res = self.pm.resolve_target(mac=mac)
                 self.assertTrue(res.reachable)
                 self.assertTrue(res.verified)
+                self.assertEqual(res.verification, "match")
                 self.assertEqual(res.ip, "192.168.1.100")
                 self.assertEqual(res.source, "cache")
 
@@ -51,7 +52,7 @@ class TestResolution(unittest.TestCase):
 
         # IP 192.168.1.100 now belongs to a different MAC!
         with patch.object(self.pm, "_check_port_open", return_value=True):
-            with patch.object(self.pm, "verify_device_identity", return_value=(False, "AA:BB:CC:DD:EE:FF", "OTHER")):
+            with patch.object(self.pm, "verify_device_identity", return_value=("mismatch", "AA:BB:CC:DD:EE:FF", "OTHER")):
                 with patch("app.printer_manager.get_ip_for_mac", return_value=None):
                     res = self.pm.resolve_target(mac=mac)
                     self.assertFalse(res.reachable)
@@ -62,7 +63,7 @@ class TestResolution(unittest.TestCase):
         mac = "00:11:22:33:44:55"
         with patch("app.printer_manager.get_ip_for_mac", return_value="192.168.1.105"):
             with patch.object(self.pm, "_check_port_open", return_value=True):
-                with patch.object(self.pm, "verify_device_identity", return_value=(True, mac, "ZEB999")):
+                with patch.object(self.pm, "verify_device_identity", return_value=("match", mac, "ZEB999")):
                     res = self.pm.resolve_target(mac=mac)
                     self.assertTrue(res.reachable)
                     self.assertEqual(res.ip, "192.168.1.105")
@@ -102,11 +103,12 @@ class TestResolution(unittest.TestCase):
         hint_ip = "192.168.1.50"
 
         with patch.object(self.pm, "_check_port_open", return_value=True):
-            with patch.object(self.pm, "verify_device_identity", return_value=(True, mac, "ZEBHINT")):
+            with patch.object(self.pm, "verify_device_identity", return_value=("match", mac, "ZEBHINT")):
                 with patch.object(self.pm, "scan_subnet") as mock_scan:
                     res = self.pm.resolve_target(mac=mac, ip=hint_ip)
                     self.assertTrue(res.reachable)
                     self.assertTrue(res.verified)
+                    self.assertEqual(res.verification, "match")
                     self.assertEqual(res.ip, hint_ip)
                     self.assertEqual(res.source, "hint")
                     # scan_subnet was NOT called because hint verified
@@ -125,7 +127,7 @@ class TestResolution(unittest.TestCase):
 
         with patch.object(self.pm, "_check_port_open", side_effect=mock_port_open):
             with patch("app.printer_manager.get_ip_for_mac", return_value=arp_ip):
-                with patch.object(self.pm, "verify_device_identity", return_value=(True, mac, "ZEBARP")):
+                with patch.object(self.pm, "verify_device_identity", return_value=("match", mac, "ZEBARP")):
                     res = self.pm.resolve_target(mac=mac, ip=hint_ip)
                     self.assertTrue(res.reachable)
                     self.assertEqual(res.ip, arp_ip)
@@ -136,6 +138,48 @@ class TestResolution(unittest.TestCase):
         self.assertTrue(res.reachable)
         self.assertEqual(res.ip, "test")
         self.assertEqual(res.source, "test")
+
+    def test_verify_device_identity_tri_state(self):
+        mac = "00:11:22:33:44:55"
+        diff_mac = "AA:BB:CC:DD:EE:FF"
+
+        # 1. Match state
+        with patch("app.printer_manager._query_snmp_mac", return_value=mac):
+            with patch("app.printer_manager._query_snmp_string", return_value="ZEB123"):
+                status, det_mac, det_ser = self.pm.verify_device_identity("192.168.1.50", expected_mac=mac, expected_serial="ZEB123")
+                self.assertEqual(status, "match")
+                self.assertEqual(det_mac, mac)
+                self.assertEqual(det_ser, "ZEB123")
+
+        # 2. Mismatch state
+        with patch("app.printer_manager._query_snmp_mac", return_value=diff_mac):
+            with patch("app.printer_manager._query_snmp_string", return_value="OTHER"):
+                status, det_mac, det_ser = self.pm.verify_device_identity("192.168.1.50", expected_mac=mac, expected_serial="ZEB123")
+                self.assertEqual(status, "mismatch")
+
+        # 3. Unverifiable state (no SNMP, no ARP)
+        with patch("app.printer_manager._query_snmp_mac", return_value=None):
+            with patch("app.printer_manager._query_snmp_string", return_value=""):
+                with patch("app.printer_manager.get_mac_for_ip", return_value=""):
+                    status, det_mac, det_ser = self.pm.verify_device_identity("192.168.1.50", expected_mac=mac)
+                    self.assertEqual(status, "unverifiable")
+                    self.assertIsNone(det_mac)
+
+    def test_unverifiable_identity_fail_open_by_default(self):
+        mac = "00:11:22:33:44:55"
+        self.pm._network_printers[mac] = {
+            "mac": mac,
+            "ip": "192.168.1.100",
+            "port": 9100,
+            "serial": "ZEB123",
+        }
+        with patch.object(self.pm, "_check_port_open", return_value=True):
+            with patch.object(self.pm, "verify_device_identity", return_value=("unverifiable", None, None)):
+                res = self.pm.resolve_target(mac=mac)
+                self.assertTrue(res.reachable)
+                self.assertFalse(res.verified)
+                self.assertEqual(res.verification, "unverifiable")
+                self.assertEqual(res.ip, "192.168.1.100")
 
 
 class TestPrintBridgeResolution(unittest.TestCase):
@@ -149,6 +193,7 @@ class TestPrintBridgeResolution(unittest.TestCase):
         config.scan_network = False
         config.network_timeout = 0.1
         config.log_level = "INFO"
+        config.strict_identity = False
         config.config_dir = Path(self.tmp_dir.name)
         config.port = 5050
         config.printer_ip = "127.0.0.1"
@@ -216,10 +261,41 @@ class TestPrintBridgeResolution(unittest.TestCase):
             "serial": "ZEB123",
         }
         with patch.object(self.bridge.printer_manager, "_check_port_open", return_value=True) as mock_port:
-            with patch.object(self.bridge.printer_manager, "verify_device_identity", return_value=(True, mac, "ZEB123")) as mock_verify:
+            with patch.object(self.bridge.printer_manager, "verify_device_identity", return_value=("match", mac, "ZEB123")) as mock_verify:
                 res = self.bridge.check_connection(target=mac)
                 self.assertTrue(res["success"])
                 self.assertEqual(res["printer_ip"], "192.168.1.100")
                 mock_port.assert_called_once()
                 mock_verify.assert_called_once()
+
+
+
+    def test_strict_identity_rejects_unverifiable_job(self):
+        self.bridge.config.strict_identity = True
+        job_data = {
+            "printer_ip": "192.168.1.80",
+            "raw_command": "^XA^FDHello^FS^XZ",
+            "source": "unit-test",
+        }
+        with patch.object(self.bridge.printer_manager, "_check_port_open", return_value=True):
+            with patch.object(self.bridge.printer_manager, "verify_device_identity", return_value=("unverifiable", None, None)):
+                resp = self.bridge.on_job_received(job_data)
+                self.assertFalse(resp["success"])
+                self.assertEqual(resp.get("status_code"), 503)
+                self.assertIn("strict_identity", resp["message"])
+
+    def test_connection_endpoint_returns_unverifiable_identity(self):
+        mac = "00:11:22:33:44:55"
+        self.bridge.printer_manager._network_printers[mac] = {
+            "mac": mac,
+            "ip": "192.168.1.100",
+            "port": 9100,
+            "serial": "ZEB123",
+        }
+        with patch.object(self.bridge.printer_manager, "_check_port_open", return_value=True):
+            with patch.object(self.bridge.printer_manager, "verify_device_identity", return_value=("unverifiable", None, None)):
+                res = self.bridge.check_connection(target=mac)
+                self.assertTrue(res["success"])
+                self.assertEqual(res.get("identity"), "unverifiable")
+
 

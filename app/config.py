@@ -24,6 +24,7 @@ class Config:
         'printer_aliases': {},
         'custom_subnets': ['192.168.0.0/22'],
         'verify_identity': True,
+        'strict_identity': False,
     }
 
     def __init__(self, config_path: str = None):
@@ -111,6 +112,15 @@ class Config:
     @verify_identity.setter
     def verify_identity(self, value: bool):
         self._config['verify_identity'] = value
+        self._save()
+
+    @property
+    def strict_identity(self) -> bool:
+        return bool(self._config.get('strict_identity', False))
+
+    @strict_identity.setter
+    def strict_identity(self, value: bool):
+        self._config['strict_identity'] = value
         self._save()
 
     def get(self, key: str, default=None):
