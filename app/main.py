@@ -340,7 +340,7 @@ class PrintBridge:
         )
 
         # If not resolved:
-        if not resolved.ip and not resolved.use_local:
+        if not resolved.resolved or (not resolved.ip and not resolved.use_local):
             message = resolved.message or "No valid printer target found. Specify printer_mac, printer_ip, or printer_name."
             self._record_runtime_event(
                 "job_rejected_unreachable_printer",
@@ -486,6 +486,26 @@ class PrintBridge:
             printer_mac=resolved.mac,
             printer_name=resolved.printer_name,
         )
+
+        if not resolved.resolved:
+            latency_ms = round((perf_counter() - started_at) * 1000, 2)
+            message = resolved.message or "printer_ip, printer_mac, or printer_name is required"
+            self._record_runtime_event(
+                "connection_check_completed",
+                printer_ip="",
+                printer_mac=resolved.mac,
+                printer_type="unknown",
+                success=False,
+                latency_ms=latency_ms,
+            )
+            return {
+                "success": False,
+                "printer_ip": "",
+                "printer_mac": resolved.mac,
+                "printer_type": "unknown",
+                "message": message,
+                "latency_ms": latency_ms,
+            }
 
         if resolved.source == "test" or resolved.ip == "test":
             latency_ms = round((perf_counter() - started_at) * 1000, 2)

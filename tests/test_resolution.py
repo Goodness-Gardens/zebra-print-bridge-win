@@ -1,3 +1,4 @@
+import socket
 import tempfile
 import unittest
 from pathlib import Path
@@ -297,5 +298,31 @@ class TestPrintBridgeResolution(unittest.TestCase):
                 res = self.bridge.check_connection(target=mac)
                 self.assertTrue(res["success"])
                 self.assertEqual(res.get("identity"), "unverifiable")
+
+    def test_unresolvable_hostname_single_scan_and_max_three_dns(self):
+        self.bridge.printer_manager.scan_network = True
+        job_data = {
+            "printer_ip": "zebra-ghost-printer",
+            "raw_command": "^XA^FDHello^FS^XZ",
+            "source": "unit-test",
+        }
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("Name or service not known")) as mock_dns:
+            with patch.object(self.bridge.printer_manager, "scan_subnet") as mock_scan:
+                resp = self.bridge.on_job_received(job_data)
+                self.assertFalse(resp["success"])
+                self.assertIn("Cannot resolve", resp["message"])
+                # Exactly 1 scan_subnet call throughout entire on_job_received
+                mock_scan.assert_called_once()
+                # At most 3 getaddrinfo calls (name, .local, .localdomain)
+                self.assertEqual(mock_dns.call_count, 3)
+                calls = [c[0][0] for c in mock_dns.call_args_list]
+                self.assertEqual(calls, ["zebra-ghost-printer", "zebra-ghost-printer.local", "zebra-ghost-printer.localdomain"])
+
+    def test_check_connection_unresolvable_hostname(self):
+        self.bridge.printer_manager.scan_network = False
+        with patch("socket.getaddrinfo", side_effect=socket.gaierror("Name or service not known")):
+            res = self.bridge.check_connection(target="zebra-ghost-printer")
+            self.assertFalse(res["success"])
+            self.assertIn("Cannot resolve", res["message"])
 
 

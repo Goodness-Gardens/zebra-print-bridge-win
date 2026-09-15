@@ -1275,6 +1275,7 @@ class PrinterManager:
             return ResolvedTarget(
                 mac=norm_mac,
                 reachable=False,
+                resolved=False,
                 message=f"Printer with MAC {norm_mac} not found on network",
             )
 
@@ -1292,8 +1293,9 @@ class PrinterManager:
 
             # DNS resolution
             try:
-                socket.getaddrinfo(addr, None)
-                return ResolvedTarget(ip=addr, port=port, source="dns")
+                ai = socket.getaddrinfo(addr, None)
+                resolved_ip = ai[0][4][0] if ai and len(ai[0]) > 4 and ai[0][4] else addr
+                return ResolvedTarget(host=addr, ip=resolved_ip, port=port, source="dns", resolved=True)
             except socket.gaierror:
                 pass
 
@@ -1302,8 +1304,9 @@ class PrinterManager:
                 for suffix in (".local", ".localdomain"):
                     cand = f"{addr}{suffix}"
                     try:
-                        socket.getaddrinfo(cand, None)
-                        return ResolvedTarget(ip=cand, port=port, source="mdns")
+                        ai = socket.getaddrinfo(cand, None)
+                        resolved_ip = ai[0][4][0] if ai and len(ai[0]) > 4 and ai[0][4] else cand
+                        return ResolvedTarget(host=addr, ip=resolved_ip, port=port, source="mdns", resolved=True)
                     except socket.gaierror:
                         pass
 
@@ -1312,13 +1315,20 @@ class PrinterManager:
                 with self._scan_lock:
                     with self._lock:
                         if addr_lower in self._alias_map:
-                            return ResolvedTarget(ip=self._alias_map[addr_lower], port=port, source="alias")
+                            return ResolvedTarget(host=addr, ip=self._alias_map[addr_lower], port=port, source="alias", resolved=True)
                     self.scan_subnet()
                     with self._lock:
                         if addr_lower in self._alias_map:
-                            return ResolvedTarget(ip=self._alias_map[addr_lower], port=port, source="discovery")
+                            return ResolvedTarget(host=addr, ip=self._alias_map[addr_lower], port=port, source="discovery", resolved=True)
 
-            return ResolvedTarget(ip=addr, port=port, message=f"Cannot resolve network address '{addr}'")
+            return ResolvedTarget(
+                host=addr,
+                port=port,
+                resolved=False,
+                ip=None,
+                reachable=False,
+                message=f"Cannot resolve network address '{addr}'",
+            )
 
         # 4. Local OS Printer: printer_name
         if printer_name:
@@ -1348,7 +1358,7 @@ class PrinterManager:
                     reachable=True,
                     message=f"Printer '{clean_name}' not found; fell back to default OS printer '{default_local['name']}'",
                 )
-            return ResolvedTarget(printer_name=clean_name, message=f"Printer '{clean_name}' not found in OS or network")
+            return ResolvedTarget(printer_name=clean_name, resolved=False, message=f"Printer '{clean_name}' not found in OS or network")
 
         # 5. Fallback: OS default printer
         default_local = self.get_default_local_printer()
@@ -1361,7 +1371,7 @@ class PrinterManager:
                 message=f"Using default OS printer '{default_local['name']}'",
             )
 
-        return ResolvedTarget(message="No printer target specified")
+        return ResolvedTarget(resolved=False, message="No printer target specified")
 
     def resolve_network_address(self, address: str) -> str:
         """
@@ -1494,14 +1504,6 @@ class PrinterManager:
             return False, "No printer address"
 
         resolved_address = address
-        if is_valid_mac(resolved_address):
-            res = self.resolve_target(mac=resolved_address)
-            resolved_address = res.ip or address
-            if not expected_mac:
-                expected_mac = normalize_mac(address)
-        elif not is_valid_ipv4(resolved_address):
-            res = self.resolve_target(ip=address)
-            resolved_address = res.ip or address
 
         timeout = max(self.network_timeout, 1.5)
         try:
