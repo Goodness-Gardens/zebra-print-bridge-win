@@ -23,17 +23,11 @@ from app.config import Config, get_platform_info
 from app.printer_manager import PrinterManager
 from app.server import PrintServer
 from app.utils import (
-    get_local_ip,
-    get_local_mac,
     get_hostname,
-    is_valid_target,
-    is_valid_ipv4,
+    get_local_ip,
     is_valid_mac,
-    normalize_mac,
-    get_mac_for_ip,
-    normalize_target,
     normalize_raw_command,
-    parse_target_address_port,
+    normalize_target,
 )
 
 
@@ -202,67 +196,6 @@ class PrintBridge:
 
         self.logger.info("Zebra Print Bridge service stopped.")
 
-    def _build_network_printer(self, target: str) -> Dict:
-        """Build a transient network printer object from IP or hostname, supporting optional :port."""
-        address, port = parse_target_address_port(target, self.printer_manager.DEFAULT_PORT)
-        resolved_address = self.printer_manager.resolve_network_address(address)
-        display_name = f"Printer @ {address}:{port}" if port != self.printer_manager.DEFAULT_PORT else f"Printer @ {address}"
-        return {
-            "name": display_name,
-            "type": "network",
-            "address": resolved_address,
-            "original_target": address,
-            "port": port,
-            "status": "direct",
-        }
-
-    def _build_printer_target(self, target: str, printer_name: str = None) -> Dict:
-        """Build target printer config (local name, real IP, or simulated test target)."""
-        # If a local printer name is provided, resolve it first
-        if printer_name:
-            local = self.printer_manager.find_local_printer(printer_name)
-            if local:
-                self._record_runtime_event(
-                    "printer_target_resolved",
-                    printer_type="local",
-                    printer_name=local["name"],
-                )
-                return local
-            # Fallback to default OS printer if specific printer_name not found
-            default_local = self.printer_manager.get_default_local_printer()
-            if default_local:
-                self._record_runtime_event(
-                    "printer_target_resolved",
-                    printer_type="local",
-                    printer_name=default_local["name"],
-                    fallback_from=printer_name,
-                )
-                return default_local
-            # Not found — return a sentinel so callers can handle
-            self._record_runtime_event(
-                "printer_target_not_found",
-                printer_type="local",
-                printer_name=printer_name,
-            )
-            return {
-                "name": printer_name,
-                "type": "local",
-                "status": "not_found",
-            }
-
-        target_stripped = normalize_target(target or "")
-        if target_stripped.lower() == "test":
-            self._record_runtime_event("printer_target_resolved", printer_type="test")
-            return {
-                "name": "Test Printer",
-                "type": "test",
-                "address": "test",
-                "port": self.printer_manager.DEFAULT_PORT,
-                "status": "simulated",
-            }
-        self._record_runtime_event("printer_target_resolved", printer_type="network", printer_ip=target_stripped)
-        return self._build_network_printer(target_stripped)
-
     def _process_queue(self):
         """Process print jobs from the queue."""
         while self.running:
@@ -337,28 +270,6 @@ class PrintBridge:
                     self.logger.info("Job [%s] completed successfully.", job["id"])
                 self._mark_job_completed(job["id"])
             else:
-                # If local printer failed during dispatch, attempt fallback to network if available
-                fallback_target = job.get("fallback_ip")
-                if use_local and fallback_target:
-                    self.logger.warning(
-                        "Job [%s] failed on local printer '%s' (%s). Attempting fallback to '%s'...",
-                        job["id"], printer_name, error, fallback_target
-                    )
-                    net_printer = {
-                        "name": f"Printer @ {fallback_target}",
-                        "type": "network",
-                        "address": fallback_target,
-                        "port": port,
-                        "status": "direct",
-                    }
-                    net_success, net_error = self.printer_manager.send_zpl(net_printer, job["raw_command"])
-                    if net_success:
-                        self.logger.info("Job [%s] completed successfully via fallback network printer '%s'.", job["id"], fallback_target)
-                        self._mark_job_completed(job["id"])
-                        continue
-                    else:
-                        error = f"Local print failed ({error}) and network fallback '{fallback_target}' also failed: {net_error}"
-
                 self.logger.error("Job [%s] failed. Reason: %s", job["id"], error)
                 self._mark_job_failed(job["id"], error or "Unknown print error")
 
@@ -502,7 +413,6 @@ class PrintBridge:
             "printer_name": final_printer_name,
             "port": resolved_port,
             "use_local": use_local,
-            "fallback_ip": printer_ip if use_local and printer_ip and printer_ip.lower() != "test" else None,
             "raw_command": raw_command,
             "raw_length": len(raw_command),
             "status": "pending",
@@ -726,13 +636,12 @@ class PrintBridge:
         ]
 
         server_hostname = get_hostname()
-        server_mac = get_local_mac()
         return {
             "server_running": self.running,
             "mode": "raw_printing",
             "server_hostname": server_hostname,
             "hostname": server_hostname,
-            "server_mac": server_mac,
+            "server_mac": None,
             "pending_jobs": stats_copy["pending"],
             "completed_jobs": stats_copy["completed"],
             "failed_jobs": stats_copy["failed"],
