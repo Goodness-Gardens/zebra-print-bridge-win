@@ -159,6 +159,10 @@ class PrintBridge:
             on_list_printers=self.list_printers,
             on_refresh_printers=self.refresh_printers,
             on_clear_printer_cache=self.clear_printer_cache,
+            on_get_subnets=self.get_subnets,
+            on_scan_subnets=self.scan_subnets,
+            on_add_custom_subnet=self.add_custom_subnet,
+            on_remove_custom_subnet=self.remove_custom_subnet,
             verify_identity=getattr(self.config, "verify_identity", True),
             strict_identity=getattr(self.config, "strict_identity", False),
         )
@@ -636,6 +640,35 @@ class PrintBridge:
         self._record_runtime_event("printer_cache_cleared")
         self.printer_manager.clear_cache()
         return {"success": True, "message": "Printer cache cleared successfully"}
+
+    def get_subnets(self) -> Dict:
+        """Get information about available network interfaces, subnets, and custom subnets."""
+        self._record_runtime_event("subnets_info_requested")
+        return self.printer_manager.get_subnets_info()
+
+    def scan_subnets(self, subnet: Optional[str] = None, clear_cache: bool = False) -> Dict:
+        """Scan all subnets or a specific subnet for Zebra printers."""
+        self._record_runtime_event("subnets_scan_requested", subnet=subnet, clear_cache=clear_cache)
+        discovered = self.printer_manager.scan_subnet(clear_cache=clear_cache, specific_subnet=subnet)
+        return {
+            "scanned_subnet": subnet or "all",
+            "discovered_printers": list(discovered.values()),
+            "count": len(discovered),
+        }
+
+    def add_custom_subnet(self, subnet: str) -> Dict:
+        """Add a custom subnet to configuration and printer manager."""
+        self._record_runtime_event("custom_subnet_added", subnet=subnet)
+        updated = self.config.add_custom_subnet(subnet)
+        self.printer_manager.custom_subnets = updated
+        return self.printer_manager.get_subnets_info()
+
+    def remove_custom_subnet(self, subnet: str) -> Dict:
+        """Remove a custom subnet from configuration and printer manager."""
+        self._record_runtime_event("custom_subnet_removed", subnet=subnet)
+        updated = self.config.remove_custom_subnet(subnet)
+        self.printer_manager.custom_subnets = updated
+        return self.printer_manager.get_subnets_info()
 
     def get_status(self) -> Dict:
         """Get current status for API."""

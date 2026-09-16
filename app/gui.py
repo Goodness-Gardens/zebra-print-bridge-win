@@ -344,7 +344,9 @@ class ZebraBridgeApp(ctk.CTk):
                     if clear_cache:
                         self._append_log_safe("[INFO] Clearing printer cache...")
                         self.bridge.printer_manager.clear_cache()
-                    self._append_log_safe("[INFO] Scanning current network for Zebra printers...")
+                    subnets_info = self.bridge.get_subnets()
+                    active_subnets = subnets_info.get("all_subnets", [])
+                    self._append_log_safe(f"[INFO] Scanning subnets {active_subnets} for Zebra printers...")
                     self.bridge.printer_manager.scan_subnet(clear_cache=clear_cache)
                     self._append_log_safe("[INFO] Network scan completed.")
                 else:

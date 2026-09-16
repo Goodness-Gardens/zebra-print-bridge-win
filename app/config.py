@@ -106,6 +106,18 @@ class Config:
         self._config['custom_subnets'] = value
         self._save()
 
+    def add_custom_subnet(self, subnet: str) -> List[str]:
+        subnets = list(self.custom_subnets)
+        if subnet not in subnets:
+            subnets.append(subnet)
+            self.custom_subnets = subnets
+        return self.custom_subnets
+
+    def remove_custom_subnet(self, subnet: str) -> List[str]:
+        subnets = [s for s in self.custom_subnets if s != subnet]
+        self.custom_subnets = subnets
+        return self.custom_subnets
+
     @property
     def verify_identity(self) -> bool:
         return bool(self._config.get('verify_identity', True))

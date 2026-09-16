@@ -362,27 +362,262 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     }
 
 
-def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Network]:
-    """Detect local IPv4 network subnets automatically and merge custom/VPN subnets."""
-    subnets = []
-    # Try ifconfig on macOS / Linux
+def parse_windows_ipconfig(text: str) -> List[Dict]:
+    """Parse Windows ipconfig /all output supporting both English and Spanish."""
+    results = []
+    current_adapter = "Ethernet"
+    current_ip = None
+    for line in text.splitlines():
+        adapter_match = re.match(
+            r"^\s*(?:[A-Za-z0-9_\-\.\s]+adapter|Adaptador[A-Za-z0-9_\-\.\s]+)\s+([^:\r\n]+):",
+            line,
+            re.IGNORECASE,
+        )
+        if adapter_match:
+            current_adapter = adapter_match.group(1).strip()
+            current_ip = None
+            continue
+
+        ip_match = re.search(
+            r"(?:IPv4|Direcci[oó]n\s*IPv4)[^:]*:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+            line,
+            re.IGNORECASE,
+        )
+        if ip_match:
+            current_ip = ip_match.group(1).strip()
+            continue
+
+        mask_match = re.search(
+            r"(?:Subnet\s*Mask|M[aá]scara\s*de\s*subred)[^:]*:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+            line,
+            re.IGNORECASE,
+        )
+        if mask_match and current_ip:
+            mask = mask_match.group(1).strip()
+            if not current_ip.startswith("127.") and not current_ip.startswith("169.254."):
+                try:
+                    net = ipaddress.IPv4Network(f"{current_ip}/{mask}", strict=False)
+                    if 8 <= net.prefixlen <= 30:
+                        results.append({
+                            "interface": current_adapter,
+                            "ip": current_ip,
+                            "netmask": mask,
+                            "cidr": str(net),
+                            "prefix_len": net.prefixlen,
+                            "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                        })
+                except Exception:
+                    pass
+            current_ip = None
+    return results
+
+
+def get_windows_subnets_powershell() -> List[Dict]:
+    """Query Windows network adapters via PowerShell Get-NetIPAddress."""
     try:
-        out = run_command(["ifconfig"])
-        for line in out.splitlines():
-            m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]+)", line)
-            if m:
-                ip = m.group(1)
-                if ip.startswith("127."):
-                    continue
-                hex_val = int(m.group(2), 16)
-                mask_str = socket.inet_ntoa(hex_val.to_bytes(4, "big"))
-                net = ipaddress.IPv4Network(f"{ip}/{mask_str}", strict=False)
-                if 20 <= net.prefixlen <= 30 and net not in subnets:
-                    subnets.append(net)
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback' } | Select-Object InterfaceAlias,IPAddress,PrefixLength | ConvertTo-Json",
+        ]
+        out = run_command(cmd, timeout=3.0)
+        if not out.strip():
+            return []
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        results = []
+        for item in data:
+            ip = item.get("IPAddress")
+            prefix = item.get("PrefixLength")
+            alias = item.get("InterfaceAlias", "Unknown")
+            if ip and prefix and not ip.startswith("127.") and not ip.startswith("169.254."):
+                try:
+                    net = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+                    if 8 <= net.prefixlen <= 30:
+                        results.append({
+                            "interface": alias,
+                            "ip": ip,
+                            "netmask": str(net.netmask),
+                            "cidr": str(net),
+                            "prefix_len": net.prefixlen,
+                            "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                        })
+                except Exception:
+                    pass
+        return results
+    except Exception:
+        return []
+
+
+def get_unix_subnets() -> List[Dict]:
+    """Detect network subnets on macOS / Linux via ifconfig or ip addr."""
+    results = []
+    try:
+        out = run_command(["ifconfig"], timeout=3.0)
+        if out:
+            current_iface = ""
+            for line in out.splitlines():
+                if line and not line[0].isspace() and ":" in line:
+                    current_iface = line.split(":")[0].strip()
+                m = re.search(
+                    r"inet\s+(\d+\.\d+\.\d+\.\d+)(?:\s+-->\s+\S+)?\s+netmask\s+(0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)",
+                    line,
+                )
+                if m and current_iface:
+                    ip = m.group(1)
+                    if ip.startswith("127.") or ip.startswith("169.254."):
+                        continue
+                    mask_raw = m.group(2)
+                    if mask_raw.startswith("0x"):
+                        hex_val = int(mask_raw, 16)
+                        mask_str = socket.inet_ntoa(hex_val.to_bytes(4, "big"))
+                    else:
+                        mask_str = mask_raw
+                    try:
+                        net = ipaddress.IPv4Network(f"{ip}/{mask_str}", strict=False)
+                        if 8 <= net.prefixlen <= 30:
+                            results.append({
+                                "interface": current_iface,
+                                "ip": ip,
+                                "netmask": mask_str,
+                                "cidr": str(net),
+                                "prefix_len": net.prefixlen,
+                                "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                            })
+                        elif net.prefixlen == 32 and (
+                            current_iface.lower().startswith(("utun", "tun", "ppp", "wg"))
+                            or "POINTOPOINT" in line
+                        ):
+                            vpn_net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+                            results.append({
+                                "interface": f"{current_iface} (VPN)",
+                                "ip": ip,
+                                "netmask": "255.255.255.0",
+                                "cidr": str(vpn_net),
+                                "prefix_len": 24,
+                                "hosts_count": 254,
+                            })
+                    except Exception:
+                        pass
     except Exception:
         pass
 
-    # Fallback to local machine IP with /24
+    if not results:
+        try:
+            out = run_command(["ip", "-4", "-o", "addr", "show"], timeout=3.0)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "inet":
+                    iface = parts[1]
+                    cidr = parts[3]
+                    try:
+                        net = ipaddress.IPv4Network(cidr, strict=False)
+                        ip_str = cidr.split("/")[0]
+                        if not ip_str.startswith("127.") and not ip_str.startswith("169.254."):
+                            if 8 <= net.prefixlen <= 30:
+                                results.append({
+                                    "interface": iface,
+                                    "ip": ip_str,
+                                    "netmask": str(net.netmask),
+                                    "cidr": str(net),
+                                    "prefix_len": net.prefixlen,
+                                    "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                                })
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return results
+
+
+def detect_all_interface_subnets() -> List[Dict]:
+    """Detect all active IPv4 network interface subnets across Windows, macOS, and Linux."""
+    sys_name = platform.system()
+    subnets = []
+
+    if sys_name == "Windows":
+        subnets = get_windows_subnets_powershell()
+        if not subnets:
+            out = run_command(["ipconfig", "/all"], timeout=3.0)
+            if out:
+                subnets = parse_windows_ipconfig(out)
+    else:
+        subnets = get_unix_subnets()
+
+    seen_cidrs = set()
+    deduped = []
+    for item in subnets:
+        cidr = item["cidr"]
+        if cidr not in seen_cidrs:
+            seen_cidrs.add(cidr)
+            deduped.append(item)
+
+    if not deduped:
+        try:
+            local_ip = get_local_ip()
+            if local_ip and not local_ip.startswith("127."):
+                net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+                deduped.append({
+                    "interface": "Default",
+                    "ip": local_ip,
+                    "netmask": "255.255.255.0",
+                    "cidr": str(net),
+                    "prefix_len": 24,
+                    "hosts_count": 254,
+                })
+        except Exception:
+            pass
+
+    return deduped
+
+
+def get_available_subnets_info(custom_subnets: List[str] = None) -> Dict:
+    """Get rich metadata about detected and custom subnets."""
+    detected = detect_all_interface_subnets()
+    custom_list = []
+    for s in (custom_subnets or []):
+        if not s:
+            continue
+        try:
+            net = ipaddress.IPv4Network(str(s).strip(), strict=False)
+            custom_list.append({
+                "cidr": str(net),
+                "prefix_len": net.prefixlen,
+                "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+            })
+        except Exception:
+            pass
+
+    merged_networks = get_local_subnets(custom_subnets)
+    all_cidrs = [str(n) for n in merged_networks]
+    total_ips = sum(n.num_addresses - 2 if n.prefixlen <= 30 else 1 for n in merged_networks)
+
+    return {
+        "detected_subnets": detected,
+        "custom_subnets": custom_list,
+        "all_subnets": all_cidrs,
+        "total_subnets": len(all_cidrs),
+        "total_ips": total_ips,
+    }
+
+
+def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Network]:
+    """Detect local IPv4 network subnets automatically and merge custom/VPN subnets."""
+    detected = detect_all_interface_subnets()
+    subnets: List[ipaddress.IPv4Network] = []
+
+    for item in detected:
+        try:
+            net = ipaddress.IPv4Network(item["cidr"], strict=False)
+            if net not in subnets:
+                subnets.append(net)
+        except Exception:
+            pass
+
+    # Fallback to local machine IP with /24 if still empty
     if not subnets:
         try:
             local_ip = get_local_ip()
@@ -405,6 +640,7 @@ def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Ne
             logger.warning("Invalid custom subnet '%s': %s", s, e)
 
     return subnets
+
 
 
 class PrinterManager:
@@ -808,12 +1044,24 @@ class PrinterManager:
 
         return changed
 
-    def scan_subnet(self, clear_cache: bool = False) -> Dict[str, Dict]:
-        """Scan all local subnets for port 9100 Zebra printers concurrently."""
+    def get_subnets_info(self) -> Dict:
+        """Return full information about detected and custom subnets."""
+        return get_available_subnets_info(self.custom_subnets)
+
+    def scan_subnet(self, clear_cache: bool = False, specific_subnet: Optional[str] = None) -> Dict[str, Dict]:
+        """Scan all local subnets (or a specific subnet) for port 9100 Zebra printers concurrently."""
         if clear_cache:
             self.clear_cache()
 
-        subnets = get_local_subnets(self.custom_subnets)
+        if specific_subnet:
+            try:
+                subnets = [ipaddress.IPv4Network(str(specific_subnet).strip(), strict=False)]
+            except Exception as e:
+                logger.error("Invalid subnet '%s': %s", specific_subnet, e)
+                return {}
+        else:
+            subnets = get_local_subnets(self.custom_subnets)
+
         if not subnets:
             return {}
 

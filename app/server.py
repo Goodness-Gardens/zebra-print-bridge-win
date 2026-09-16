@@ -48,6 +48,11 @@ class PrintJob(BaseModel):
     label_size: Optional[Dict[str, float]] = None
 
 
+class SubnetRequest(BaseModel):
+    """Request model for adding custom subnets."""
+    subnet: Optional[str] = None
+
+
 class PrintResponse(BaseModel):
     """Response model for print requests"""
 
@@ -83,6 +88,10 @@ class PrintServer:
         on_list_printers: Callable = None,
         on_refresh_printers: Callable = None,
         on_clear_printer_cache: Callable = None,
+        on_get_subnets: Callable = None,
+        on_scan_subnets: Callable = None,
+        on_add_custom_subnet: Callable = None,
+        on_remove_custom_subnet: Callable = None,
         verify_identity: bool = True,
         strict_identity: bool = False,
     ):
@@ -94,6 +103,10 @@ class PrintServer:
         self.on_list_printers = on_list_printers
         self.on_refresh_printers = on_refresh_printers
         self.on_clear_printer_cache = on_clear_printer_cache
+        self.on_get_subnets = on_get_subnets
+        self.on_scan_subnets = on_scan_subnets
+        self.on_add_custom_subnet = on_add_custom_subnet
+        self.on_remove_custom_subnet = on_remove_custom_subnet
         self.verify_identity = verify_identity
         self.strict_identity = strict_identity
         self.is_running = False
@@ -257,6 +270,10 @@ class PrintServer:
                     "printers": "/printers (GET, accepts ?refresh=true) — list discovered network printers and OS-installed printers",
                     "printers_refresh": "/printers/refresh (POST) — clear cache and re-scan network printers",
                     "printers_clear": "/printers/clear (POST) — clear printer cache",
+                    "subnets": "/subnets (GET, accepts ?scan=true) — list detected network interfaces and subnets",
+                    "subnets_scan": "/subnets/scan (GET/POST, ?subnet=<CIDR>&clear_cache=<bool>) — scan subnets for Zebra printers",
+                    "subnets_add": "/subnets (POST JSON: {\"subnet\": \"<CIDR>\"}) — add custom subnet to config",
+                    "subnets_delete": "/subnets?subnet=<CIDR> (DELETE) — remove custom subnet from config",
                     "connection": "/connection?printer_mac=<MAC>&printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
                     "status": "/status (GET)",
                     "health": "/health (GET)",
@@ -698,6 +715,103 @@ class PrintServer:
                 return result
             except Exception as e:
                 logger.error("Error clearing printer cache: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/subnets")
+        def get_subnets_endpoint(scan: bool = False, clear_cache: bool = False):
+            """Get all available network interface subnets and custom subnets. Pass ?scan=true to also scan."""
+            self._record_usage("subnets_requested", scan=scan)
+            if not self.on_get_subnets:
+                raise HTTPException(status_code=500, detail="Subnet handler not configured")
+            try:
+                subnets_info = self.on_get_subnets()
+                server_hostname = get_hostname()
+                response = {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **subnets_info,
+                }
+                if scan and self.on_scan_subnets:
+                    scan_result = self.on_scan_subnets(clear_cache=clear_cache)
+                    response["scan_result"] = scan_result
+                return response
+            except Exception as e:
+                logger.error("Error getting subnets: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/subnets/scan")
+        @app.post("/subnets/scan")
+        def scan_subnets_endpoint(subnet: Optional[str] = None, clear_cache: bool = False):
+            """Scan all available subnets or a specific subnet for Zebra printers."""
+            self._record_usage("subnets_scan_requested", subnet=subnet)
+            if not self.on_scan_subnets:
+                raise HTTPException(status_code=500, detail="Subnet scan handler not configured")
+            try:
+                result = self.on_scan_subnets(subnet=subnet, clear_cache=clear_cache)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Subnet scan completed for {subnet or 'all available subnets'}",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except Exception as e:
+                logger.error("Error scanning subnets: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/subnets")
+        def add_custom_subnet_endpoint(request_data: Optional[SubnetRequest] = None, subnet: Optional[str] = None):
+            """Add a custom subnet (e.g. '10.0.1.0/24') to configuration."""
+            target_subnet = (request_data.subnet if request_data and request_data.subnet else subnet or "").strip()
+            if not target_subnet:
+                raise HTTPException(status_code=400, detail="Field 'subnet' is required (e.g. '10.0.1.0/24')")
+            try:
+                import ipaddress
+                ipaddress.IPv4Network(target_subnet, strict=False)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid IPv4 subnet format: {e}")
+
+            self._record_usage("subnet_add_requested", subnet=target_subnet)
+            if not self.on_add_custom_subnet:
+                raise HTTPException(status_code=500, detail="Add subnet handler not configured")
+            try:
+                updated_info = self.on_add_custom_subnet(target_subnet)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Custom subnet '{target_subnet}' added successfully",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    "added_subnet": target_subnet,
+                    **updated_info,
+                }
+            except Exception as e:
+                logger.error("Error adding custom subnet: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.delete("/subnets")
+        def remove_custom_subnet_endpoint(subnet: str):
+            """Remove a custom subnet from configuration."""
+            target_subnet = (subnet or "").strip()
+            if not target_subnet:
+                raise HTTPException(status_code=400, detail="Query parameter 'subnet' is required")
+            self._record_usage("subnet_remove_requested", subnet=target_subnet)
+            if not self.on_remove_custom_subnet:
+                raise HTTPException(status_code=500, detail="Remove subnet handler not configured")
+            try:
+                updated_info = self.on_remove_custom_subnet(target_subnet)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Custom subnet '{target_subnet}' removed successfully",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    "removed_subnet": target_subnet,
+                    **updated_info,
+                }
+            except Exception as e:
+                logger.error("Error removing custom subnet: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))
 
         return app
