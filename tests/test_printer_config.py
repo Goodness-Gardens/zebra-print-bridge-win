@@ -19,6 +19,50 @@ def test_printer_config_schema_structure():
     assert "direct thermal" in options["print_method"]["choices"]
     assert "thermal transfer" in options["print_method"]["choices"]
     assert "gap/notch" in options["media_type"]["choices"]
+    assert "save_to_flash" in options
+
+
+def test_set_printer_sgd_config_features(monkeypatch):
+    from unittest.mock import MagicMock
+    from app.printer_manager import set_printer_sgd_config
+
+    sent_data = []
+
+    mock_sock = MagicMock()
+    mock_sock.recv.return_value = b'"applied_val"\r\n'
+
+    def fake_sendall(data):
+        sent_data.append(data)
+
+    mock_sock.sendall = fake_sendall
+
+    monkeypatch.setattr(
+        "app.printer_manager.connect_smart_socket",
+        lambda ip, port, timeout: mock_sock,
+    )
+
+    settings = {
+        "print_method": "direct thermal",
+        "print_width": 609,
+        "device.friendly_name": "NEW_NAME",
+        "raw_command": "~JC",
+        "save_to_flash": True,
+    }
+
+    success, applied, err = set_printer_sgd_config("192.168.1.150", 9100, settings)
+    assert success is True
+    assert err is None
+    assert applied["print_method"] == "applied_val"
+    assert applied["device.friendly_name"] == "applied_val"
+    assert applied["raw_command"] == '"applied_val"'
+    assert applied["save_to_flash"] is True
+
+    # Check that ^XA^JUS^XZ was sent
+    assert any(b"^XA^JUS^XZ" in d for d in sent_data)
+    # Check that raw command ~JC was sent
+    assert any(b"~JC" in d for d in sent_data)
+    # Check that device.friendly_name SGD command was sent
+    assert any(b'device.friendly_name' in d for d in sent_data)
 
 
 @pytest.mark.anyio

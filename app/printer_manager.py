@@ -2223,6 +2223,11 @@ PRINTER_CONFIG_SCHEMA = {
             "description": "Hardware printhead resolution in dots per inch (e.g. 203, 300, 600)",
             "sgd_var": "head.resolution.in_dpi",
         },
+        "save_to_flash": {
+            "type": "boolean",
+            "default": False,
+            "description": "Persist configuration changes permanently to non-volatile printer memory (^JUS command)",
+        },
     },
     "example_payload": {
         "print_method": "direct thermal",
@@ -2232,6 +2237,7 @@ PRINTER_CONFIG_SCHEMA = {
         "print_mode": "tear off",
         "speed": 6.0,
         "darkness": 30.0,
+        "save_to_flash": True,
     },
 }
 
@@ -2318,8 +2324,10 @@ def set_printer_sgd_config(
         return False, {}, f"Cannot connect to printer at {ip}:{port}"
 
     applied = {}
+    save_to_flash = bool(settings.get("save_to_flash", False) or settings.get("save", False))
+
     for user_key, user_val in settings.items():
-        if user_val is None:
+        if user_val is None or user_key in ("save_to_flash", "save"):
             continue
         key_norm = user_key.lower().strip()
 
@@ -2378,17 +2386,39 @@ def set_printer_sgd_config(
             sgd_var = "print.tone"
             sgd_val = f"{float(user_val):.1f}"
 
+        elif "." in user_key:
+            # Direct/arbitrary SGD variable (e.g. "device.friendly_name", "zpl.format_prefix")
+            sgd_var = user_key.strip()
+            sgd_val = str(user_val)
+
+        elif key_norm in ("raw_command", "command", "raw_sgd"):
+            cmd = str(user_val).strip()
+            if not cmd.endswith("\r\n"):
+                cmd += "\r\n"
+            sock.sendall(cmd.encode("utf-8"))
+            time.sleep(0.06)
+            try:
+                resp = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            except Exception:
+                resp = "sent"
+            applied[user_key] = resp or "sent"
+            continue
+
         if sgd_var and sgd_val is not None:
-            set_cmd = f"! U1 setvar \"{sgd_var}\" \"{sgd_val}\"\r\n".encode("utf-8")
+            set_cmd = f'! U1 setvar "{sgd_var}" "{sgd_val}"\r\n'.encode("utf-8")
             sock.sendall(set_cmd)
             time.sleep(0.05)
-            get_cmd = f"! U1 getvar \"{sgd_var}\"\r\n".encode("utf-8")
+            get_cmd = f'! U1 getvar "{sgd_var}"\r\n'.encode("utf-8")
             sock.sendall(get_cmd)
             time.sleep(0.05)
             read_back = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
             applied[user_key] = read_back or sgd_val
 
+    if save_to_flash:
+        # ^XA^JUS^XZ instructs the Zebra printer to persist settings to non-volatile memory (EEPROM)
+        sock.sendall(b"^XA^JUS^XZ\r\n")
+        time.sleep(0.05)
+        applied["save_to_flash"] = True
+
     sock.close()
     return True, applied, None
-
-
