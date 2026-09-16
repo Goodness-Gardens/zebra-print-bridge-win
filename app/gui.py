@@ -449,7 +449,7 @@ class ZebraBridgeApp(ctk.CTk):
         ).pack(anchor="w")
 
         if is_offline or not ip:
-            ip_display = "IP:  última IP desconocida"
+            ip_display = "IP:  last known IP unknown"
         else:
             ip_display = f"IP:  {ip}:{port}"
 
