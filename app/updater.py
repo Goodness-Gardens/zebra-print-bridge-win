@@ -1,6 +1,7 @@
 """
 Auto-updater module for Zebra Print Bridge.
-Checks a version.json hosted on GitHub Pages and offers to download a new installer.
+Checks version.json on the GitHub repository (raw content of the main branch)
+and offers to download the installer attached to the matching GitHub Release.
 """
 
 import glob

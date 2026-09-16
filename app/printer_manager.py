@@ -1,7 +1,10 @@
 """
 Printer Manager for Zebra printers
-Handles communication via Network (TCP/IP) and local OS-installed printers
-(win32print on Windows).
+Handles communication via Network (TCP/IP port 9100) and local OS-installed printers
+(win32print on Windows, CUPS on macOS/Linux).
+Also provides single-pass target resolution (MAC / IP / hostname / alias / OS printer),
+SNMP + ARP identity verification, passive subnet discovery and the persistent
+identity-indexed printer cache (network_printers.json, v2).
 """
 
 import concurrent.futures
