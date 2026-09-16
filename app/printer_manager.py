@@ -2073,4 +2073,322 @@ class PrinterManager:
 
         return None
 
+    def get_printer_config(self, target: str) -> Dict:
+        """Get live configuration from a network Zebra printer."""
+        resolved = self.resolve_target(ip=target, host=target, printer_name=target)
+        if not resolved.resolved or not resolved.ip:
+            raise ValueError(resolved.message or f"Printer '{target}' not found or unreachable")
+
+        if resolved.use_local:
+            local = self.find_local_printer(resolved.printer_name or target)
+            return {
+                "success": True,
+                "target": target,
+                "printer_type": "local",
+                "name": resolved.printer_name,
+                "message": "Local OS spooler printer (hardware SGD queries only supported via network TCP/IP port 9100)",
+                "local_info": local or {},
+            }
+
+        res = get_printer_sgd_config(resolved.ip, resolved.port)
+        return {
+            "success": True,
+            "target": target,
+            "resolved_ip": resolved.ip,
+            "port": resolved.port,
+            "printer_type": "network",
+            **res,
+            "schema": PRINTER_CONFIG_SCHEMA["options"],
+        }
+
+    def set_printer_config(self, target: str, settings: Dict) -> Dict:
+        """Apply live configuration to a network Zebra printer via SGD without printing."""
+        resolved = self.resolve_target(ip=target, host=target, printer_name=target)
+        if not resolved.resolved or not resolved.ip:
+            raise ValueError(resolved.message or f"Printer '{target}' not found or unreachable")
+
+        if resolved.use_local:
+            raise ValueError(
+                f"Direct configuration via SGD is only supported for network Zebra printers, but '{target}' is a local OS printer."
+            )
+
+        success, applied, err = set_printer_sgd_config(resolved.ip, resolved.port, settings)
+        if not success:
+            raise RuntimeError(err or "Failed to apply printer configuration")
+
+        updated = get_printer_sgd_config(resolved.ip, resolved.port)
+        return {
+            "success": True,
+            "message": f"Configuration applied successfully to '{target}' ({resolved.ip}:{resolved.port})",
+            "target": target,
+            "resolved_ip": resolved.ip,
+            "port": resolved.port,
+            "applied_settings": applied,
+            "current_config": updated.get("config", {}),
+        }
+
+    def get_printer_config_schema(self) -> Dict:
+        """Return the complete schema of configurable options."""
+        return PRINTER_CONFIG_SCHEMA
+
+
+def connect_smart_socket(ip: str, port: int = 9100, timeout: float = 3.0) -> Optional[socket.socket]:
+    """Connect to a printer IP, binding to local interface if direct routing fails (e.g. multi-homed / VPN)."""
+    # 1. Try standard connection
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return s
+    except Exception:
+        s.close()
+
+    # 2. Try binding to detected interfaces
+    try:
+        subnets = detect_all_interface_subnets()
+        for iface in subnets:
+            if_ip = iface.get("ip")
+            if not if_ip or if_ip.startswith("127."):
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.bind((if_ip, 0))
+                s.connect((ip, port))
+                return s
+            except Exception:
+                s.close()
+    except Exception:
+        pass
+
+    return None
+
+
+PRINTER_CONFIG_SCHEMA = {
+    "options": {
+        "print_method": {
+            "type": "string",
+            "choices": ["direct thermal", "thermal transfer"],
+            "description": "Printing method: direct thermal (heat-sensitive paper, ribbonless) or thermal transfer (uses ribbon)",
+            "sgd_var": "ezpl.print_method",
+        },
+        "media_type": {
+            "type": "string",
+            "choices": ["gap/notch", "continuous", "mark"],
+            "description": "Media sensor type: gap/notch (die-cut labels with gap), continuous (receipt paper), mark (black mark on backing)",
+            "sgd_var": "ezpl.media_type",
+        },
+        "print_mode": {
+            "type": "string",
+            "choices": ["tear off", "peel off", "rewind", "cutter"],
+            "description": "Action after printing: tear off, peel off, rewind, or cutter",
+            "sgd_var": "ezpl.print_mode",
+        },
+        "print_width": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Printhead printable width in dots (e.g. 609 for 3.0\" at 203 dpi, 832 for 4.09\" at 203 dpi)",
+            "min": 2,
+            "max": 32000,
+            "sgd_var": "ezpl.print_width",
+        },
+        "label_length": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Label length in dots (e.g. 430 for ~2.12\" at 203 dpi, 1200 for ~5.9\" at 203 dpi)",
+            "min": 1,
+            "max": 32000,
+            "sgd_var": "zpl.label_length",
+        },
+        "speed": {
+            "type": "number",
+            "unit": "ips",
+            "description": "Print speed in inches per second (e.g. 2.0, 3.0, 4.0, 5.0, 6.0)",
+            "min": 2.0,
+            "max": 14.0,
+            "sgd_var": "media.speed",
+        },
+        "darkness": {
+            "type": "number",
+            "unit": "tone",
+            "description": "Print darkness / head tone (0.0 to 30.0)",
+            "min": 0.0,
+            "max": 30.0,
+            "sgd_var": "print.tone",
+        },
+        "resolution_dpi": {
+            "type": "integer",
+            "read_only": True,
+            "unit": "dpi",
+            "description": "Hardware printhead resolution in dots per inch (e.g. 203, 300, 600)",
+            "sgd_var": "head.resolution.in_dpi",
+        },
+    },
+    "example_payload": {
+        "print_method": "direct thermal",
+        "print_width": 609,
+        "label_length": 430,
+        "media_type": "gap/notch",
+        "print_mode": "tear off",
+        "speed": 6.0,
+        "darkness": 30.0,
+    },
+}
+
+
+def get_printer_sgd_config(ip: str, port: int = 9100, timeout: float = 3.0) -> Dict:
+    """Query live configuration from a Zebra printer using SGD (Set/Get/Do) read-only queries."""
+    sock = connect_smart_socket(ip, port, timeout=timeout)
+    if not sock:
+        raise ConnectionError(f"Cannot connect to printer at {ip}:{port}")
+
+    queries = {
+        "model": "device.product_name",
+        "friendly_name": "device.friendly_name",
+        "serial_number": "device.unique_id",
+        "firmware": "appl.name",
+        "dpi": "head.resolution.in_dpi",
+        "print_method": "ezpl.print_method",
+        "print_width": "ezpl.print_width",
+        "label_length": "zpl.label_length",
+        "media_type": "ezpl.media_type",
+        "print_mode": "ezpl.print_mode",
+        "speed": "media.speed",
+        "darkness": "print.tone",
+        "status": "display.text",
+    }
+
+    raw = {}
+    for key, var in queries.items():
+        try:
+            sock.sendall(f"! U1 getvar \"{var}\"\r\n".encode("utf-8"))
+            time.sleep(0.04)
+            val = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+            raw[key] = val
+        except Exception:
+            raw[key] = None
+
+    sock.close()
+
+    dpi_val = int(raw["dpi"]) if raw.get("dpi") and raw["dpi"].isdigit() else 203
+    width_dots = int(raw["print_width"]) if raw.get("print_width") and raw["print_width"].isdigit() else None
+    length_dots = int(raw["label_length"]) if raw.get("label_length") and raw["label_length"].isdigit() else None
+    speed_ips = float(raw["speed"]) if raw.get("speed") and raw["speed"].replace(".", "", 1).isdigit() else None
+    darkness_tone = float(raw["darkness"]) if raw.get("darkness") and raw["darkness"].replace(".", "", 1).isdigit() else None
+
+    width_inches = round(width_dots / dpi_val, 2) if width_dots and dpi_val else None
+    length_inches = round(length_dots / dpi_val, 2) if length_dots and dpi_val else None
+
+    method = raw.get("print_method") or ""
+    if "thermal trans" in method:
+        method = "thermal transfer"
+    elif "direct thermal" in method or "direct" in method:
+        method = "direct thermal"
+
+    return {
+        "model": raw.get("model") or "Zebra Printer",
+        "friendly_name": raw.get("friendly_name") or "",
+        "serial_number": raw.get("serial_number") or "",
+        "firmware": raw.get("firmware") or "",
+        "status": " ".join((raw.get("status") or "").split()),
+        "config": {
+            "dpi": dpi_val,
+            "print_method": method,
+            "print_width_dots": width_dots,
+            "print_width_inches": width_inches,
+            "label_length_dots": length_dots,
+            "label_length_inches": length_inches,
+            "media_type": raw.get("media_type"),
+            "print_mode": raw.get("print_mode"),
+            "speed_ips": speed_ips,
+            "darkness": darkness_tone,
+        },
+    }
+
+
+def set_printer_sgd_config(
+    ip: str, port: int = 9100, settings: Dict = None, timeout: float = 3.0
+) -> Tuple[bool, Dict, Optional[str]]:
+    """Apply configuration parameters to a Zebra printer via SGD without printing."""
+    if not settings:
+        return True, {}, None
+
+    sock = connect_smart_socket(ip, port, timeout=timeout)
+    if not sock:
+        return False, {}, f"Cannot connect to printer at {ip}:{port}"
+
+    applied = {}
+    for user_key, user_val in settings.items():
+        if user_val is None:
+            continue
+        key_norm = user_key.lower().strip()
+
+        sgd_var = None
+        sgd_val = None
+
+        if key_norm in ("print_method", "method"):
+            sgd_var = "ezpl.print_method"
+            val_str = str(user_val).lower().strip()
+            if "direct" in val_str or val_str == "dt":
+                sgd_val = "direct thermal"
+            elif "trans" in val_str or val_str == "tt":
+                sgd_val = "thermal trans"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("print_width", "width"):
+            sgd_var = "ezpl.print_width"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("label_length", "length"):
+            sgd_var = "zpl.label_length"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("media_type", "type"):
+            sgd_var = "ezpl.media_type"
+            val_str = str(user_val).lower().strip()
+            if "gap" in val_str or "notch" in val_str:
+                sgd_val = "gap/notch"
+            elif "cont" in val_str:
+                sgd_val = "continuous"
+            elif "mark" in val_str:
+                sgd_val = "mark"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("print_mode", "mode"):
+            sgd_var = "ezpl.print_mode"
+            val_str = str(user_val).lower().strip()
+            if "tear" in val_str:
+                sgd_val = "tear off"
+            elif "peel" in val_str:
+                sgd_val = "peel off"
+            elif "rewind" in val_str:
+                sgd_val = "rewind"
+            elif "cutter" in val_str or "cut" in val_str:
+                sgd_val = "cutter"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("speed", "print_speed"):
+            sgd_var = "media.speed"
+            sgd_val = f"{float(user_val):.1f}"
+
+        elif key_norm in ("darkness", "tone"):
+            sgd_var = "print.tone"
+            sgd_val = f"{float(user_val):.1f}"
+
+        if sgd_var and sgd_val is not None:
+            set_cmd = f"! U1 setvar \"{sgd_var}\" \"{sgd_val}\"\r\n".encode("utf-8")
+            sock.sendall(set_cmd)
+            time.sleep(0.05)
+            get_cmd = f"! U1 getvar \"{sgd_var}\"\r\n".encode("utf-8")
+            sock.sendall(get_cmd)
+            time.sleep(0.05)
+            read_back = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+            applied[user_key] = read_back or sgd_val
+
+    sock.close()
+    return True, applied, None
+
 

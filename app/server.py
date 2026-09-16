@@ -53,6 +53,18 @@ class SubnetRequest(BaseModel):
     subnet: Optional[str] = None
 
 
+class PrinterConfigUpdateModel(BaseModel):
+    """Request model for updating printer configuration via SGD."""
+    target: Optional[str] = None
+    print_method: Optional[str] = None
+    print_width: Optional[int] = None
+    label_length: Optional[int] = None
+    media_type: Optional[str] = None
+    print_mode: Optional[str] = None
+    speed: Optional[float] = None
+    darkness: Optional[float] = None
+
+
 class PrintResponse(BaseModel):
     """Response model for print requests"""
 
@@ -92,6 +104,9 @@ class PrintServer:
         on_scan_subnets: Callable = None,
         on_add_custom_subnet: Callable = None,
         on_remove_custom_subnet: Callable = None,
+        on_get_printer_config: Callable = None,
+        on_set_printer_config: Callable = None,
+        on_get_config_schema: Callable = None,
         verify_identity: bool = True,
         strict_identity: bool = False,
     ):
@@ -107,6 +122,9 @@ class PrintServer:
         self.on_scan_subnets = on_scan_subnets
         self.on_add_custom_subnet = on_add_custom_subnet
         self.on_remove_custom_subnet = on_remove_custom_subnet
+        self.on_get_printer_config = on_get_printer_config
+        self.on_set_printer_config = on_set_printer_config
+        self.on_get_config_schema = on_get_config_schema
         self.verify_identity = verify_identity
         self.strict_identity = strict_identity
         self.is_running = False
@@ -270,6 +288,9 @@ class PrintServer:
                     "printers": "/printers (GET, accepts ?refresh=true) — list discovered network printers and OS-installed printers",
                     "printers_refresh": "/printers/refresh (POST) — clear cache and re-scan network printers",
                     "printers_clear": "/printers/clear (POST) — clear printer cache",
+                    "printer_config": "/printers/{target}/config (GET) — get hardware configuration (method, width, length, etc.)",
+                    "printer_config_update": "/printers/{target}/config (POST JSON) — update hardware configuration via SGD without printing",
+                    "printer_config_schema": "/printers/config/schema (GET) — get complete schema of configurable options",
                     "subnets": "/subnets (GET, accepts ?scan=true) — list detected network interfaces and subnets",
                     "subnets_scan": "/subnets/scan (GET/POST, ?subnet=<CIDR>&clear_cache=<bool>) — scan subnets for Zebra printers",
                     "subnets_add": "/subnets (POST JSON: {\"subnet\": \"<CIDR>\"}) — add custom subnet to config",
@@ -715,6 +736,82 @@ class PrintServer:
                 return result
             except Exception as e:
                 logger.error("Error clearing printer cache: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/printers/config/schema")
+        def get_printer_config_schema_endpoint():
+            """Get the complete schema of configurable printer options, data types, and accepted choices."""
+            self._record_usage("printer_config_schema_requested")
+            if not self.on_get_config_schema:
+                raise HTTPException(status_code=500, detail="Config schema handler not configured")
+            return self.on_get_config_schema()
+
+        @app.get("/printers/config")
+        @app.get("/printers/{target:path}/config")
+        def get_printer_config_endpoint(
+            target: Optional[str] = None,
+            printer_ip: Optional[str] = None,
+            printer_mac: Optional[str] = None,
+            printer_name: Optional[str] = None,
+        ):
+            """Get live hardware configuration from a Zebra printer (resolution, print method, label size, etc.)."""
+            resolved_target = (target or printer_ip or printer_mac or printer_name or "").strip()
+            if not resolved_target or resolved_target == "schema":
+                raise HTTPException(status_code=400, detail="Target printer (name, IP, or MAC) is required")
+            self._record_usage("printer_config_get_requested", target=resolved_target)
+            if not self.on_get_printer_config:
+                raise HTTPException(status_code=500, detail="Printer config handler not configured")
+            try:
+                result = self.on_get_printer_config(resolved_target)
+                server_hostname = get_hostname()
+                return {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except ConnectionError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+            except Exception as e:
+                logger.error("Error getting printer config for '%s': %s", resolved_target, e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/printers/config")
+        @app.post("/printers/{target:path}/config")
+        def set_printer_config_endpoint(
+            config_data: PrinterConfigUpdateModel,
+            target: Optional[str] = None,
+        ):
+            """Update hardware configuration on a Zebra printer via SGD without printing."""
+            resolved_target = (target or config_data.target or "").strip()
+            if not resolved_target:
+                raise HTTPException(status_code=400, detail="Target printer (name, IP, or MAC) is required")
+
+            settings = {
+                k: v for k, v in config_data.model_dump().items()
+                if k != "target" and v is not None
+            }
+            if not settings:
+                raise HTTPException(status_code=400, detail="At least one configuration field must be provided")
+
+            self._record_usage("printer_config_set_requested", target=resolved_target)
+            if not self.on_set_printer_config:
+                raise HTTPException(status_code=500, detail="Printer config handler not configured")
+            try:
+                result = self.on_set_printer_config(resolved_target, settings)
+                server_hostname = get_hostname()
+                return {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except ConnectionError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+            except Exception as e:
+                logger.error("Error setting printer config for '%s': %s", resolved_target, e)
                 raise HTTPException(status_code=500, detail=str(e))
 
         @app.get("/subnets")

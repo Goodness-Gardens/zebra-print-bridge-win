@@ -163,6 +163,9 @@ class PrintBridge:
             on_scan_subnets=self.scan_subnets,
             on_add_custom_subnet=self.add_custom_subnet,
             on_remove_custom_subnet=self.remove_custom_subnet,
+            on_get_printer_config=self.get_printer_config,
+            on_set_printer_config=self.set_printer_config,
+            on_get_config_schema=self.get_printer_config_schema,
             verify_identity=getattr(self.config, "verify_identity", True),
             strict_identity=getattr(self.config, "strict_identity", False),
         )
@@ -669,6 +672,20 @@ class PrintBridge:
         updated = self.config.remove_custom_subnet(subnet)
         self.printer_manager.custom_subnets = updated
         return self.printer_manager.get_subnets_info()
+
+    def get_printer_config(self, target: str) -> Dict:
+        """Get live configuration from a network Zebra printer."""
+        self._record_runtime_event("printer_config_requested", target=target)
+        return self.printer_manager.get_printer_config(target)
+
+    def set_printer_config(self, target: str, settings: Dict) -> Dict:
+        """Apply live configuration to a network Zebra printer via SGD."""
+        self._record_runtime_event("printer_config_update_requested", target=target)
+        return self.printer_manager.set_printer_config(target, settings)
+
+    def get_printer_config_schema(self) -> Dict:
+        """Return the complete schema of configurable options."""
+        return self.printer_manager.get_printer_config_schema()
 
     def get_status(self) -> Dict:
         """Get current status for API."""
