@@ -15,7 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 
 from . import __version__
 from .config import get_platform_info
@@ -55,6 +55,8 @@ class SubnetRequest(BaseModel):
 
 class PrinterConfigUpdateModel(BaseModel):
     """Request model for updating printer configuration via SGD."""
+    model_config = ConfigDict(extra="allow")
+
     target: Optional[str] = None
     print_method: Optional[str] = None
     print_width: Optional[int] = None
@@ -63,6 +65,10 @@ class PrinterConfigUpdateModel(BaseModel):
     print_mode: Optional[str] = None
     speed: Optional[float] = None
     darkness: Optional[float] = None
+    save_to_flash: Optional[bool] = None
+    raw_command: Optional[str] = None
+    command: Optional[str] = None
+    raw_sgd: Optional[str] = None
 
 
 class PrintResponse(BaseModel):
