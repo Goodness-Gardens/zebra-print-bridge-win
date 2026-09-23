@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app.config import Config, get_platform_info
 from app.printer_manager import PrinterManager
 from app.server import PrintServer
+from app.suitelet_sync import SuiteletSyncManager
 from app.utils import (
     get_hostname,
     get_local_ip,
@@ -94,9 +95,30 @@ class PrintBridge:
         self.running = False
         self._jobs_lock = threading.Lock()
 
+        self.suitelet_sync = SuiteletSyncManager(
+            config=self.config,
+            get_server_info=self._get_server_sync_info,
+        )
+
         signal.signal(signal.SIGINT, self._signal_handler)
         if sys.platform != "win32":
             signal.signal(signal.SIGTERM, self._signal_handler)
+
+    def _get_server_sync_info(self) -> Dict:
+        """Resolve current server parameters for Suitelet sync."""
+        local_ip = get_local_ip()
+        return {
+            "ip": local_ip,
+            "mac": get_local_mac(local_ip),
+            "port": self.config.port,
+            "name": self.config.server_name or get_hostname(),
+            "priority": self.config.server_priority,
+        }
+
+    def sync_server_to_suitelet(self) -> Dict:
+        """Manually trigger synchronization with NetSuite Suitelet."""
+        self._record_runtime_event("suitelet_sync_requested")
+        return self.suitelet_sync.sync_now()
 
     @staticmethod
     def _format_runtime_details(details: Dict) -> str:
@@ -166,6 +188,7 @@ class PrintBridge:
             on_get_printer_config=self.get_printer_config,
             on_set_printer_config=self.set_printer_config,
             on_get_config_schema=self.get_printer_config_schema,
+            on_server_sync=self.sync_server_to_suitelet,
             verify_identity=getattr(self.config, "verify_identity", True),
             strict_identity=getattr(self.config, "strict_identity", False),
         )
@@ -187,6 +210,9 @@ class PrintBridge:
         self.logger.info(f"  Test UI:     http://{local_ip or 'localhost'}:{self.config.port}/test-client")
         self.logger.info("=" * 50)
 
+        # Start NetSuite Suitelet server synchronization if configured
+        self.suitelet_sync.start(ip=local_ip, mac=local_mac, port=self.config.port)
+
         self.server.run()
 
     def stop(self):
@@ -194,6 +220,9 @@ class PrintBridge:
         self._record_runtime_event("bridge_stop_requested")
         self.logger.info("Zebra Print Bridge service stopping.")
         self.running = False
+
+        if hasattr(self, "suitelet_sync") and self.suitelet_sync:
+            self.suitelet_sync.stop()
 
         if self.server:
             self.server.shutdown()
@@ -719,6 +748,7 @@ class PrintBridge:
             "failed_jobs": stats_copy["failed"],
             "recent_jobs": recent_jobs,
             "runtime_counters": runtime_snapshot["counters"],
+            "suitelet_sync": self.suitelet_sync.get_status() if hasattr(self, "suitelet_sync") else None,
         }
 
     def clear_logs_state(self) -> Dict:

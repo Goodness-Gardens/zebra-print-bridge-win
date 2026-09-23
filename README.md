@@ -21,6 +21,7 @@ web applications and forwards them to Zebra printers over TCP/IP or to printers 
 - **Hostname & Alias Resolution**: DNS, mDNS (`.local`), discovered names/hostnames/serials, and user-defined aliases
 - **Web Test Client**: Built-in browser UI at `/dashboard`
 - **Queued Processing** with connection preflight: unreachable printers are rejected before enqueueing
+- **NetSuite Suitelet Server Synchronization**: Automatically registers or updates the server record (MAC, IP, port, name, priority) via an external NetSuite Suitelet on startup, on demand, or through periodic heartbeat
 - **Auto-Updater**: Checks `version.json` on GitHub and offers one-click download and install
 - **Automated Releases**: GitHub Actions builds the PyInstaller bundle, compiles the Inno Setup installer, tags and publishes the release
 
@@ -681,6 +682,28 @@ Built-in web test client. Open it in a browser to list printers, run connection 
 
 ```
 http://192.168.1.100:5050/dashboard
+```
+
+#### `POST /api/server/sync` and `GET /api/server/sync`
+
+Manually trigger server registration/synchronization with NetSuite Suitelet (`customscript_lpui_sl_server_sync`).
+Assembles local MAC, IP, port, server name, priority, and calls the configured Suitelet URL.
+
+```bash
+curl -X POST http://localhost:5050/api/server/sync
+```
+
+```json
+{
+  "success": true,
+  "status_code": 200,
+  "duration_ms": 145.2,
+  "message": "Server synced successfully with NetSuite Suitelet",
+  "mac": "62:39:A2:0D:A4:B5",
+  "ip": "192.168.1.11",
+  "port": 5050,
+  "name": "Miami Yaki PC"
+}
 ```
 
 ---

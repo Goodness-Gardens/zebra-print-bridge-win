@@ -121,6 +121,7 @@ class PrintServer:
         on_get_printer_config: Callable = None,
         on_set_printer_config: Callable = None,
         on_get_config_schema: Callable = None,
+        on_server_sync: Callable = None,
         verify_identity: bool = True,
         strict_identity: bool = False,
     ):
@@ -139,6 +140,7 @@ class PrintServer:
         self.on_get_printer_config = on_get_printer_config
         self.on_set_printer_config = on_set_printer_config
         self.on_get_config_schema = on_get_config_schema
+        self.on_server_sync = on_server_sync
         self.verify_identity = verify_identity
         self.strict_identity = strict_identity
         self.is_running = False
@@ -923,6 +925,20 @@ class PrintServer:
                 }
             except Exception as e:
                 logger.error("Error removing custom subnet: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/api/server/sync")
+        @app.post("/api/server/sync")
+        def sync_server_endpoint():
+            """Manually trigger synchronization of this server with NetSuite Suitelet."""
+            self._record_usage("server_sync_requested")
+            if not self.on_server_sync:
+                raise HTTPException(status_code=501, detail="Server sync handler not configured")
+            try:
+                res = self.on_server_sync()
+                return res
+            except Exception as e:
+                logger.error("Error syncing server: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))
 
         return app

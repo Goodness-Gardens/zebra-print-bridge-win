@@ -311,7 +311,22 @@ class ZebraBridgeApp(ctk.CTk):
         self.update_link.bind("<Button-1>", lambda e: self._manual_check_updates())
         self.update_link.bind("<Enter>", lambda e: self.update_link.configure(font=ctk.CTkFont(size=11, underline=True)))
         self.update_link.bind("<Leave>", lambda e: self.update_link.configure(font=ctk.CTkFont(size=11, underline=False)))
-        self.update_link.pack(side="right", padx=(8, 0))
+        self.update_link.pack(side="right", padx=(6, 0))
+
+        ctk.CTkLabel(
+            footer, text="•",
+            font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
+        ).pack(side="right", padx=6)
+
+        self.sync_netsuite_link = ctk.CTkLabel(
+            footer, text="Sync NetSuite",
+            font=ctk.CTkFont(size=11), text_color=ACCENT,
+            cursor="hand2"
+        )
+        self.sync_netsuite_link.bind("<Button-1>", lambda e: self._manual_sync_netsuite())
+        self.sync_netsuite_link.bind("<Enter>", lambda e: self.sync_netsuite_link.configure(font=ctk.CTkFont(size=11, underline=True)))
+        self.sync_netsuite_link.bind("<Leave>", lambda e: self.sync_netsuite_link.configure(font=ctk.CTkFont(size=11, underline=False)))
+        self.sync_netsuite_link.pack(side="right", padx=(6, 0))
 
         ctk.CTkLabel(
             footer, text=f"v{__version__}  •",
@@ -711,6 +726,30 @@ class ZebraBridgeApp(ctk.CTk):
                 self._append_log("[INFO] Update check complete: You are already on the latest version or no update found.")
 
         check_for_updates_async(_on_result)
+
+    def _manual_sync_netsuite(self):
+        if not self.bridge or not self.server_running:
+            self._append_log("[WARNING] Cannot sync NetSuite: Server is not running.")
+            return
+
+        self.sync_netsuite_link.configure(text="Syncing...")
+        self._append_log("[INFO] Triggering manual NetSuite Suitelet server synchronization...")
+
+        def _worker():
+            try:
+                res = self.bridge.sync_server_to_suitelet()
+                success = res.get("success", False)
+                msg = res.get("message", "")
+                if success:
+                    self._append_log_safe(f"[INFO] NetSuite Sync Success: {msg}")
+                else:
+                    self._append_log_safe(f"[WARNING] NetSuite Sync Failed: {msg}")
+            except Exception as exc:
+                self._append_log_safe(f"[ERROR] NetSuite Sync Exception: {exc}")
+            finally:
+                self.after(2000, lambda: self.sync_netsuite_link.configure(text="Sync NetSuite"))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_update_check_result(self, info):
         """Called from updater thread; schedule on main thread."""
