@@ -263,6 +263,9 @@ Hosts that do not answer SNMP are remembered for 10 minutes so later requests do
 | GET  | `/printers`         | Discovered network printers + OS printers (`?refresh=true` re-scans) |
 | POST | `/printers/refresh` | Clear cache, re-scan, return fresh list |
 | POST | `/printers/clear`   | Clear the persistent printer cache |
+| GET  | `/printers/config/schema` | Complete schema of configurable options via SGD |
+| GET  | `/printers/{target}/config` | Get live hardware configuration (margins, method, width, etc.) |
+| POST | `/printers/{target}/config` | Configure hardware settings & margins without printing |
 | GET  | `/subnets`          | Detected and custom subnets (`?scan=true` also scans) |
 | GET/POST | `/subnets/scan` | Scan all subnets or one CIDR for Zebra printers |
 | POST | `/subnets`          | Add a custom subnet to the config |
@@ -549,6 +552,37 @@ Clears the in-memory cache and deletes `network_printers.json`.
 {
   "success": true,
   "message": "Printer cache cleared successfully"
+}
+```
+
+#### `GET /printers/config/schema`
+
+Returns the complete schema of all supported Zebra printer configuration settings (print method, media type, print mode, print width, label length, darkness, speed, margins: top, left, bottom, right) with descriptions, units, and validation boundaries.
+
+#### `GET /printers/{target}/config`
+
+Queries live SGD configuration from a network Zebra printer (identified by IP, MAC, hostname, or alias), including printable width, length, resolution, and current margin positions (`label_top`, `left_position`, `tear_off`).
+
+#### `POST /printers/{target}/config`
+
+Applies hardware configuration and margin offsets directly to a Zebra printer via SGD without requiring a print job.
+
+**Margin parameters supported:**
+- `top_margin` / `label_top` (`int`, dots): vertical image offset via `zpl.label_top` (positive shifts down, negative shifts up).
+- `left_margin` / `left_position` (`int`, dots): horizontal image offset via `zpl.left_position` (positive shifts right, negative shifts left).
+- `bottom_margin` / `tear_off` (`int`, dots): bottom / tear-off resting position via `ezpl.tear_off`.
+- `right_margin` (`int`, dots): right margin offset (adjusts `ezpl.print_width = width - right_margin`).
+- `margins` (`object`): composite dictionary with `{"top": 10, "left": 15, "bottom": 0, "right": 0}`.
+- `save_to_flash` (`bool`): persist configuration permanently to non-volatile EEPROM memory (`^JUS`).
+
+Example request:
+```json
+{
+  "top_margin": 10,
+  "left_margin": 15,
+  "bottom_margin": 0,
+  "right_margin": 0,
+  "save_to_flash": true
 }
 ```
 

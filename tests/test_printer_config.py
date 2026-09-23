@@ -15,6 +15,14 @@ def test_printer_config_schema_structure():
     assert "speed" in options
     assert "darkness" in options
     assert "resolution_dpi" in options
+    assert "top_margin" in options
+    assert "left_margin" in options
+    assert "bottom_margin" in options
+    assert "right_margin" in options
+    assert "label_top" in options
+    assert "left_position" in options
+    assert "tear_off" in options
+    assert "margins" in options
 
     assert "direct thermal" in options["print_method"]["choices"]
     assert "thermal transfer" in options["print_method"]["choices"]
@@ -63,6 +71,68 @@ def test_set_printer_sgd_config_features(monkeypatch):
     assert any(b"~JC" in d for d in sent_data)
     # Check that device.friendly_name SGD command was sent
     assert any(b'device.friendly_name' in d for d in sent_data)
+
+
+def test_set_printer_sgd_config_margins(monkeypatch):
+    from unittest.mock import MagicMock
+    from app.printer_manager import set_printer_sgd_config
+
+    sent_data = []
+
+    mock_sock = MagicMock()
+    mock_sock.recv.return_value = b'"applied_val"\r\n'
+
+    def fake_sendall(data):
+        sent_data.append(data)
+
+    mock_sock.sendall = fake_sendall
+
+    monkeypatch.setattr(
+        "app.printer_manager.connect_smart_socket",
+        lambda ip, port, timeout: mock_sock,
+    )
+
+    # Test 1: direct margin fields
+    settings_direct = {
+        "top_margin": 10,
+        "left_margin": 15,
+        "bottom_margin": 5,
+        "right_margin": 20,
+    }
+
+    success, applied, err = set_printer_sgd_config("192.168.1.150", 9100, settings_direct)
+    assert success is True
+    assert err is None
+    assert applied["top_margin"] == "applied_val"
+    assert applied["left_margin"] == "applied_val"
+    assert applied["bottom_margin"] == "applied_val"
+    assert applied["right_margin"] == "applied_val"
+
+    assert any(b'setvar "zpl.label_top" "10"' in d for d in sent_data)
+    assert any(b'setvar "zpl.left_position" "15"' in d for d in sent_data)
+    assert any(b'setvar "ezpl.tear_off" "5"' in d for d in sent_data)
+    assert any(b'setvar "ezpl.print_width"' in d for d in sent_data)
+
+    # Test 2: nested margins dictionary
+    sent_data.clear()
+    settings_nested = {
+        "margins": {
+            "top": 20,
+            "left": 25,
+            "bottom": 0,
+            "right": 10,
+        }
+    }
+    success2, applied2, err2 = set_printer_sgd_config("192.168.1.150", 9100, settings_nested)
+    assert success2 is True
+    assert err2 is None
+    assert "margins" in applied2
+    assert applied2["margins"]["top"] == "applied_val"
+    assert applied2["margins"]["left"] == "applied_val"
+    assert applied2["margins"]["bottom"] == "applied_val"
+    assert any(b'setvar "zpl.label_top" "20"' in d for d in sent_data)
+    assert any(b'setvar "zpl.left_position" "25"' in d for d in sent_data)
+    assert any(b'setvar "ezpl.tear_off" "0"' in d for d in sent_data)
 
 
 @pytest.mark.anyio
@@ -151,6 +221,23 @@ async def test_printer_config_endpoints():
         assert data_set["success"] is True
         assert data_set["applied_settings"]["darkness"] == 25.0
 
-        # 5. Unknown printer -> 404
+        # 5. POST /printers/NH-LSHIP1/config with margins
+        res_set_margins = await client.post(
+            "/printers/NH-LSHIP1/config",
+            json={
+                "top_margin": 10,
+                "left_margin": 15,
+                "bottom_margin": 0,
+                "right_margin": 0,
+                "margins": {"top": 10, "left": 15, "bottom": 0, "right": 0},
+            },
+        )
+        assert res_set_margins.status_code == 200
+        data_margins = res_set_margins.json()
+        assert data_margins["success"] is True
+        assert data_margins["applied_settings"]["top_margin"] == 10
+        assert data_margins["applied_settings"]["left_margin"] == 15
+
+        # 6. Unknown printer -> 404
         res_404 = await client.get("/printers/unknown/config")
         assert res_404.status_code == 404

@@ -2223,6 +2223,57 @@ PRINTER_CONFIG_SCHEMA = {
             "description": "Hardware printhead resolution in dots per inch (e.g. 203, 300, 600)",
             "sgd_var": "head.resolution.in_dpi",
         },
+        "label_top": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Top margin / vertical image position offset in dots (e.g. -120 to 120, positive shifts image down)",
+            "sgd_var": "zpl.label_top",
+        },
+        "top_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for label_top (top margin offset in dots)",
+            "sgd_var": "zpl.label_top",
+        },
+        "left_position": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Left margin / horizontal image position offset in dots (-9999 to 9999, positive shifts image right)",
+            "sgd_var": "zpl.left_position",
+        },
+        "left_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for left_position (left margin offset in dots)",
+            "sgd_var": "zpl.left_position",
+        },
+        "tear_off": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Bottom / tear-off position adjustment in dots (-120 to 120)",
+            "sgd_var": "ezpl.tear_off",
+        },
+        "bottom_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for tear_off (bottom margin / tear line adjustment in dots)",
+            "sgd_var": "ezpl.tear_off",
+        },
+        "right_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Right margin offset in dots (adjusts printable width ezpl.print_width = width - right_margin)",
+        },
+        "margins": {
+            "type": "object",
+            "description": "Composite margin settings: {top, left, bottom, right} in dots",
+            "properties": {
+                "top": "integer (dots, shifts down/up via zpl.label_top)",
+                "left": "integer (dots, shifts right/left via zpl.left_position)",
+                "bottom": "integer (dots, adjusts tear-off position via ezpl.tear_off)",
+                "right": "integer (dots, reduces ezpl.print_width)",
+            },
+        },
         "save_to_flash": {
             "type": "boolean",
             "default": False,
@@ -2237,6 +2288,10 @@ PRINTER_CONFIG_SCHEMA = {
         "print_mode": "tear off",
         "speed": 6.0,
         "darkness": 30.0,
+        "top_margin": 10,
+        "left_margin": 15,
+        "bottom_margin": 0,
+        "right_margin": 0,
         "save_to_flash": True,
     },
 }
@@ -2261,6 +2316,9 @@ def get_printer_sgd_config(ip: str, port: int = 9100, timeout: float = 3.0) -> D
         "print_mode": "ezpl.print_mode",
         "speed": "media.speed",
         "darkness": "print.tone",
+        "label_top": "zpl.label_top",
+        "left_position": "zpl.left_position",
+        "tear_off": "ezpl.tear_off",
         "status": "display.text",
     }
 
@@ -2281,6 +2339,9 @@ def get_printer_sgd_config(ip: str, port: int = 9100, timeout: float = 3.0) -> D
     length_dots = int(raw["label_length"]) if raw.get("label_length") and raw["label_length"].isdigit() else None
     speed_ips = float(raw["speed"]) if raw.get("speed") and raw["speed"].replace(".", "", 1).isdigit() else None
     darkness_tone = float(raw["darkness"]) if raw.get("darkness") and raw["darkness"].replace(".", "", 1).isdigit() else None
+    label_top_val = int(raw["label_top"].strip()) if raw.get("label_top") and raw["label_top"].strip().lstrip("-").isdigit() else 0
+    left_pos_val = int(raw["left_position"].strip()) if raw.get("left_position") and raw["left_position"].strip().lstrip("-").isdigit() else 0
+    tear_off_val = int(raw["tear_off"].strip()) if raw.get("tear_off") and raw["tear_off"].strip().lstrip("-").isdigit() else 0
 
     width_inches = round(width_dots / dpi_val, 2) if width_dots and dpi_val else None
     length_inches = round(length_dots / dpi_val, 2) if length_dots and dpi_val else None
@@ -2308,6 +2369,16 @@ def get_printer_sgd_config(ip: str, port: int = 9100, timeout: float = 3.0) -> D
             "print_mode": raw.get("print_mode"),
             "speed_ips": speed_ips,
             "darkness": darkness_tone,
+            "label_top": label_top_val,
+            "left_position": left_pos_val,
+            "tear_off": tear_off_val,
+            "margins": {
+                "top": label_top_val,
+                "left": left_pos_val,
+                "bottom": tear_off_val,
+                "right": None,
+                "print_width_dots": width_dots,
+            },
         },
     }
 
@@ -2319,6 +2390,30 @@ def set_printer_sgd_config(
     if not settings:
         return True, {}, None
 
+    settings = dict(settings)
+
+    margins_input = settings.get("margins")
+    if isinstance(margins_input, dict):
+        if "top" in margins_input or "top_margin" in margins_input:
+            settings.setdefault("top_margin", margins_input.get("top", margins_input.get("top_margin")))
+        if "left" in margins_input or "left_margin" in margins_input:
+            settings.setdefault("left_margin", margins_input.get("left", margins_input.get("left_margin")))
+        if "bottom" in margins_input or "bottom_margin" in margins_input:
+            settings.setdefault("bottom_margin", margins_input.get("bottom", margins_input.get("bottom_margin")))
+        if "right" in margins_input or "right_margin" in margins_input:
+            settings.setdefault("right_margin", margins_input.get("right", margins_input.get("right_margin")))
+
+    # If right_margin is specified along with print_width, adjust print_width
+    for rm_key in ("right_margin", "margin_right", "right"):
+        if rm_key in settings and settings[rm_key] is not None:
+            for pw_key in ("print_width", "width"):
+                if pw_key in settings and settings[pw_key] is not None:
+                    try:
+                        settings[pw_key] = max(int(settings[pw_key]) - int(settings[rm_key]), 100)
+                    except (ValueError, TypeError):
+                        pass
+            break
+
     sock = connect_smart_socket(ip, port, timeout=timeout)
     if not sock:
         return False, {}, f"Cannot connect to printer at {ip}:{port}"
@@ -2326,8 +2421,8 @@ def set_printer_sgd_config(
     applied = {}
     save_to_flash = bool(settings.get("save_to_flash", False) or settings.get("save", False))
 
-    for user_key, user_val in settings.items():
-        if user_val is None or user_key in ("save_to_flash", "save"):
+    for user_key, user_val in list(settings.items()):
+        if user_val is None or user_key in ("save_to_flash", "save", "margins"):
             continue
         key_norm = user_key.lower().strip()
 
@@ -2386,6 +2481,36 @@ def set_printer_sgd_config(
             sgd_var = "print.tone"
             sgd_val = f"{float(user_val):.1f}"
 
+        elif key_norm in ("label_top", "top_margin", "margin_top", "top"):
+            sgd_var = "zpl.label_top"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("left_position", "left_margin", "margin_left", "left"):
+            sgd_var = "zpl.left_position"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("tear_off", "bottom_margin", "margin_bottom", "bottom"):
+            sgd_var = "ezpl.tear_off"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("right_margin", "margin_right", "right"):
+            right_val = int(user_val)
+            explicit_width = settings.get("print_width", settings.get("width"))
+            if explicit_width is not None:
+                sgd_var = "ezpl.print_width"
+                sgd_val = str(int(explicit_width))
+            else:
+                try:
+                    sock.sendall(b'! U1 getvar "ezpl.print_width"\r\n')
+                    time.sleep(0.04)
+                    cur_w_str = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+                    base_w = int(cur_w_str) if cur_w_str.isdigit() else 832
+                except Exception:
+                    base_w = 832
+                new_w = max(base_w - right_val, 100) if right_val > 0 else base_w
+                sgd_var = "ezpl.print_width"
+                sgd_val = str(new_w)
+
         elif "." in user_key:
             # Direct/arbitrary SGD variable (e.g. "device.friendly_name", "zpl.format_prefix")
             sgd_var = user_key.strip()
@@ -2413,6 +2538,14 @@ def set_printer_sgd_config(
             time.sleep(0.05)
             read_back = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
             applied[user_key] = read_back or sgd_val
+
+    if isinstance(margins_input, dict):
+        applied["margins"] = {
+            "top": applied.get("top_margin", applied.get("label_top", applied.get("top"))),
+            "left": applied.get("left_margin", applied.get("left_position", applied.get("left"))),
+            "bottom": applied.get("bottom_margin", applied.get("tear_off", applied.get("bottom"))),
+            "right": applied.get("right_margin", applied.get("right")),
+        }
 
     if save_to_flash:
         # ^XA^JUS^XZ instructs the Zebra printer to persist settings to non-volatile memory (EEPROM)

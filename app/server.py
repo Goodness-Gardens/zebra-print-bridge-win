@@ -8,7 +8,7 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
@@ -65,6 +65,14 @@ class PrinterConfigUpdateModel(BaseModel):
     print_mode: Optional[str] = None
     speed: Optional[float] = None
     darkness: Optional[float] = None
+    label_top: Optional[int] = None
+    left_position: Optional[int] = None
+    tear_off: Optional[int] = None
+    top_margin: Optional[int] = None
+    left_margin: Optional[int] = None
+    bottom_margin: Optional[int] = None
+    right_margin: Optional[int] = None
+    margins: Optional[Dict[str, Any]] = None
     save_to_flash: Optional[bool] = None
     raw_command: Optional[str] = None
     command: Optional[str] = None
