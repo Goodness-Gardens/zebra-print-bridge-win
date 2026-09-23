@@ -25,6 +25,10 @@ DEFAULT_SCRIPT_ID = "customscript_lpui_sl_server_sync"
 DEFAULT_DEPLOY_ID = "customdeploy_lpui_sl_server_sync"
 DEFAULT_ACCOUNT_ID = "1224776-sb1"
 DEFAULT_COMPID = "1224776-sb1"
+DEFAULT_SUITELET_SYNC_URL = (
+    "https://1224776.extforms.netsuite.com/app/site/hosting/scriptlet.nl"
+    "?script=7386&deploy=1&compid=1224776&ns-at=AAEJ7tMQ6DO6mA03ZmQeoVF6pImvjQA8oZjVTecPH-ZTK2316cU"
+)
 
 
 def mask_url_sensitive_params(url_str: str) -> str:
@@ -131,15 +135,15 @@ class SuiteletSyncManager:
     def is_configured(self) -> bool:
         """Check if minimum configuration exists to perform sync."""
         if not self.config:
-            return False
+            return bool(DEFAULT_SUITELET_SYNC_URL)
         url = (self.config.get("suitelet_sync_url") or "").strip()
         hash_val = (self.config.get("suitelet_sync_hash") or "").strip()
-        return bool(url or hash_val)
+        return bool(url or hash_val or DEFAULT_SUITELET_SYNC_URL)
 
     def is_enabled(self) -> bool:
         """Check if sync is enabled in configuration."""
         if not self.config:
-            return False
+            return True
         # If explicitly enabled, or if URL/hash is set and suitelet_sync_enabled is not False
         enabled = self.config.get("suitelet_sync_enabled")
         if enabled is not None:
@@ -152,19 +156,20 @@ class SuiteletSyncManager:
             configured_url = (self.config.get("suitelet_sync_url") or "").strip()
             if configured_url:
                 return configured_url
-            account_id = (self.config.get("suitelet_account_id") or DEFAULT_ACCOUNT_ID).strip()
-            compid = (self.config.get("suitelet_compid") or account_id).strip()
             hash_val = (self.config.get("suitelet_sync_hash") or "").strip()
-            script_id = (self.config.get("suitelet_script_id") or DEFAULT_SCRIPT_ID).strip()
-            deploy_id = (self.config.get("suitelet_deploy_id") or DEFAULT_DEPLOY_ID).strip()
-            return build_suitelet_sync_url(
-                account_id=account_id,
-                compid=compid,
-                hash_val=hash_val,
-                script_id=script_id,
-                deploy_id=deploy_id,
-            )
-        return ""
+            if hash_val:
+                account_id = (self.config.get("suitelet_account_id") or DEFAULT_ACCOUNT_ID).strip()
+                compid = (self.config.get("suitelet_compid") or account_id).strip()
+                script_id = (self.config.get("suitelet_script_id") or DEFAULT_SCRIPT_ID).strip()
+                deploy_id = (self.config.get("suitelet_deploy_id") or DEFAULT_DEPLOY_ID).strip()
+                return build_suitelet_sync_url(
+                    account_id=account_id,
+                    compid=compid,
+                    hash_val=hash_val,
+                    script_id=script_id,
+                    deploy_id=deploy_id,
+                )
+        return DEFAULT_SUITELET_SYNC_URL
 
     def sync_now(
         self,
@@ -213,6 +218,8 @@ class SuiteletSyncManager:
             return res
 
         base_url = (self.config.get("suitelet_sync_url") or "").strip() if self.config else ""
+        if not base_url and not (self.config and (self.config.get("suitelet_sync_hash") or "").strip()):
+            base_url = DEFAULT_SUITELET_SYNC_URL
         account_id = (self.config.get("suitelet_account_id") or DEFAULT_ACCOUNT_ID).strip() if self.config else DEFAULT_ACCOUNT_ID
         compid = (self.config.get("suitelet_compid") or account_id).strip() if self.config else account_id
         hash_val = (self.config.get("suitelet_sync_hash") or "").strip() if self.config else ""
