@@ -145,18 +145,18 @@ class ZebraBridgeApp(ctk.CTk):
 
         # Update badge (hidden until update found)
         self.update_banner = ctk.CTkFrame(self, fg_color="#fef3c7", corner_radius=10)
-        self.update_label = ctk.CTkLabel(
-            self.update_banner, text="", font=ctk.CTkFont(size=13),
-            text_color=YELLOW,
-        )
-        self.update_label.pack(side="left", padx=16, pady=8)
         self.update_btn = ctk.CTkButton(
             self.update_banner, text="⬇  Download", width=130, height=32,
             font=ctk.CTkFont(size=13, weight="bold"),
             fg_color=YELLOW, text_color="#ffffff", hover_color="#b45309",
             corner_radius=8, command=self._download_update,
         )
-        self.update_btn.pack(side="right", padx=16, pady=8)
+        self.update_btn.pack(side="left", padx=(16, 12), pady=8)
+        self.update_label = ctk.CTkLabel(
+            self.update_banner, text="", font=ctk.CTkFont(size=13),
+            text_color=YELLOW,
+        )
+        self.update_label.pack(side="left", padx=(0, 16), pady=8)
         self.update_banner.pack_forget()
 
     def _card(self, parent, col, title, value, color):
