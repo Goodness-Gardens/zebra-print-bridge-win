@@ -8,13 +8,14 @@ import threading
 from datetime import datetime
 from pathlib import Path
 from time import perf_counter
-from typing import Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from starlette.concurrency import run_in_threadpool
+from pydantic import BaseModel, ConfigDict
 
 from . import __version__
 from .config import get_platform_info
@@ -47,6 +48,37 @@ class PrintJob(BaseModel):
     label_size: Optional[Dict[str, float]] = None
 
 
+class SubnetRequest(BaseModel):
+    """Request model for adding custom subnets."""
+    subnet: Optional[str] = None
+
+
+class PrinterConfigUpdateModel(BaseModel):
+    """Request model for updating printer configuration via SGD."""
+    model_config = ConfigDict(extra="allow")
+
+    target: Optional[str] = None
+    print_method: Optional[str] = None
+    print_width: Optional[int] = None
+    label_length: Optional[int] = None
+    media_type: Optional[str] = None
+    print_mode: Optional[str] = None
+    speed: Optional[float] = None
+    darkness: Optional[float] = None
+    label_top: Optional[int] = None
+    left_position: Optional[int] = None
+    tear_off: Optional[int] = None
+    top_margin: Optional[int] = None
+    left_margin: Optional[int] = None
+    bottom_margin: Optional[int] = None
+    right_margin: Optional[int] = None
+    margins: Optional[Dict[str, Any]] = None
+    save_to_flash: Optional[bool] = None
+    raw_command: Optional[str] = None
+    command: Optional[str] = None
+    raw_sgd: Optional[str] = None
+
+
 class PrintResponse(BaseModel):
     """Response model for print requests"""
 
@@ -66,6 +98,7 @@ class ConnectionCheckResponse(BaseModel):
     printer_type: str
     message: str
     latency_ms: Optional[float] = None
+    identity: Optional[str] = None
     server_hostname: Optional[str] = None
     hostname: Optional[str] = None  # Backward-compatible alias
 
@@ -81,6 +114,16 @@ class PrintServer:
         on_list_printers: Callable = None,
         on_refresh_printers: Callable = None,
         on_clear_printer_cache: Callable = None,
+        on_get_subnets: Callable = None,
+        on_scan_subnets: Callable = None,
+        on_add_custom_subnet: Callable = None,
+        on_remove_custom_subnet: Callable = None,
+        on_get_printer_config: Callable = None,
+        on_set_printer_config: Callable = None,
+        on_get_config_schema: Callable = None,
+        on_server_sync: Callable = None,
+        verify_identity: bool = True,
+        strict_identity: bool = False,
     ):
         self.port = port
         self.on_job_received = on_job_received
@@ -90,6 +133,16 @@ class PrintServer:
         self.on_list_printers = on_list_printers
         self.on_refresh_printers = on_refresh_printers
         self.on_clear_printer_cache = on_clear_printer_cache
+        self.on_get_subnets = on_get_subnets
+        self.on_scan_subnets = on_scan_subnets
+        self.on_add_custom_subnet = on_add_custom_subnet
+        self.on_remove_custom_subnet = on_remove_custom_subnet
+        self.on_get_printer_config = on_get_printer_config
+        self.on_set_printer_config = on_set_printer_config
+        self.on_get_config_schema = on_get_config_schema
+        self.on_server_sync = on_server_sync
+        self.verify_identity = verify_identity
+        self.strict_identity = strict_identity
         self.is_running = False
         self.start_time = None
         self.resource_dir = Path(__file__).resolve().parent.parent / "resources"
@@ -167,7 +220,7 @@ class PrintServer:
             }
 
         @app.get("/status")
-        async def get_status():
+        def get_status():
             """Get current server status and queue metrics."""
             self._record_usage("status_requested", log=False)
             server_hostname = get_hostname()
@@ -195,7 +248,7 @@ class PrintServer:
             return {"healthy": True}
 
         @app.get("/info")
-        async def get_info():
+        def get_info():
             """Get server info including network IP and MAC for remote access."""
             self._record_usage("info_requested")
             local_ip = self._get_local_ip()
@@ -226,16 +279,24 @@ class PrintServer:
                 "required_fields": {
                     "json_print": [
                         "raw_command (or legacy field 'zpl')",
-                        "printer_mac (Ethernet MAC address, resolves dynamically to current IP, immune to DHCP IP changes)",
-                        "printer_name (local OS printer), default OS printer (fallback 1), or printer_ip / printer_host (fallback 2)",
+                        "printer_mac (Ethernet MAC address, Priority 1: resolves dynamically to current IP, immune to DHCP changes)",
+                        "printer_ip / printer_host (Priority 2: IPv4 address, hostname, or IP hint when combined with printer_mac)",
+                        "printer_name (Priority 3: local OS spooler printer)",
+                        "OS default printer (Priority 4: fallback when no target specified)",
                     ],
-                    "raw_print": ["printer_mac, printer_ip or printer_name (query, MAC, IPv4, hostname, or 'test')", "raw body"],
+                    "raw_print": ["printer_mac, printer_ip or printer_name (query: MAC, IPv4, hostname, or 'test')", "raw body"],
                 },
                 "supported_targets": {
-                    "printer_mac": "Ethernet MAC address (e.g. '00:07:4D:6F:C2:14', '00-07-4D-6F-C2-14', '00074d6fc214') - dynamic ARP/cache IP resolution",
-                    "printer_ip": "Direct IPv4 address (e.g. '192.168.1.150') or simulated 'test'",
-                    "printer_host": "Network DNS hostname or alias (e.g. 'NH-LSHIP1')",
-                    "printer_name": "Local OS printer installed in spooler",
+                    "printer_mac": "Ethernet MAC address (e.g. '00:07:4D:6F:C2:14') - dynamic ARP/cache IP resolution (Priority 1)",
+                    "printer_ip": "Direct IPv4 address (e.g. '192.168.1.150'), simulated 'test', or IP hint with printer_mac (Priority 2)",
+                    "printer_host": "Network DNS hostname or alias (e.g. 'NH-LSHIP1') (Priority 2)",
+                    "printer_name": "Local OS printer installed in spooler (Priority 3)",
+                    "default_os_printer": "Default printer configured in OS spooler (Priority 4)",
+                },
+                "identity_verification": {
+                    "verify_identity": self.verify_identity,
+                    "strict_identity": self.strict_identity,
+                    "states": ["match", "mismatch", "unverifiable"],
                 },
                 "endpoints": {
                     "print": "/print (POST JSON, supports printer_mac, printer_ip, printer_host, printer_name)",
@@ -243,6 +304,13 @@ class PrintServer:
                     "printers": "/printers (GET, accepts ?refresh=true) — list discovered network printers and OS-installed printers",
                     "printers_refresh": "/printers/refresh (POST) — clear cache and re-scan network printers",
                     "printers_clear": "/printers/clear (POST) — clear printer cache",
+                    "printer_config": "/printers/{target}/config (GET) — get hardware configuration (method, width, length, etc.)",
+                    "printer_config_update": "/printers/{target}/config (POST JSON) — update hardware configuration via SGD without printing",
+                    "printer_config_schema": "/printers/config/schema (GET) — get complete schema of configurable options",
+                    "subnets": "/subnets (GET, accepts ?scan=true) — list detected network interfaces and subnets",
+                    "subnets_scan": "/subnets/scan (GET/POST, ?subnet=<CIDR>&clear_cache=<bool>) — scan subnets for Zebra printers",
+                    "subnets_add": "/subnets (POST JSON: {\"subnet\": \"<CIDR>\"}) — add custom subnet to config",
+                    "subnets_delete": "/subnets?subnet=<CIDR> (DELETE) — remove custom subnet from config",
                     "connection": "/connection?printer_mac=<MAC>&printer_ip=<IPv4|hostname|test>&printer_name=<name> (GET)",
                     "status": "/status (GET)",
                     "health": "/health (GET)",
@@ -254,7 +322,7 @@ class PrintServer:
             }
 
         @app.get("/connection", response_model=ConnectionCheckResponse)
-        async def check_connection(
+        def check_connection(
             request: Request,
             printer_mac: Optional[str] = None,
             mac: Optional[str] = None,
@@ -362,6 +430,7 @@ class PrintServer:
                     printer_type=result.get("printer_type", "unknown"),
                     message=result.get("message", "Connection check completed"),
                     latency_ms=result.get("latency_ms"),
+                    identity=result.get("identity"),
                     server_hostname=server_hostname,
                     hostname=server_hostname,
                 )
@@ -379,7 +448,7 @@ class PrintServer:
         # CORS preflight is handled automatically by CORSMiddleware
 
         @app.post("/print", response_model=PrintResponse)
-        async def print_label(job: PrintJob, request: Request):
+        def print_label(job: PrintJob, request: Request):
             """Send a raw command using JSON payload."""
             if not self.on_job_received:
                 raise HTTPException(status_code=500, detail="Print handler not configured")
@@ -519,7 +588,8 @@ class PrintServer:
             )
 
             try:
-                result = self.on_job_received(
+                result = await run_in_threadpool(
+                    self.on_job_received,
                     {
                         "printer_name": printer_name,
                         "printer_mac": printer_mac,
@@ -528,7 +598,7 @@ class PrintServer:
                         "source": source,
                         "id": request_id,
                         "is_localhost": is_localhost,
-                    }
+                    },
                 )
                 if not result.get("success", False):
                     self._record_usage(
@@ -579,7 +649,7 @@ class PrintServer:
             return self._get_test_client_html()
 
         @app.get("/logs")
-        async def get_logs():
+        def get_logs():
             """Get recent activity logs."""
             if self.on_status_request:
                 status = self.on_status_request()
@@ -593,7 +663,7 @@ class PrintServer:
             return {"logs": [], "usage": self._get_usage_snapshot()}
 
         @app.post("/logs/clear")
-        async def clear_logs():
+        def clear_logs():
             """Clear runtime history and truncate active log files."""
             cleared_runtime = {}
             if self.on_logs_clear:
@@ -613,7 +683,7 @@ class PrintServer:
             }
 
         @app.get("/printers")
-        async def list_printers(refresh: bool = False):
+        def list_printers(refresh: bool = False):
             """List both network and local OS-installed printers. Pass ?refresh=true to clear cache and re-scan."""
             if refresh and self.on_refresh_printers:
                 self._record_usage("printers_refresh_requested")
@@ -647,7 +717,7 @@ class PrintServer:
             }
 
         @app.post("/printers/refresh")
-        async def refresh_printers_endpoint():
+        def refresh_printers_endpoint():
             """Clear printer cache, re-scan local network, and return fresh printer list."""
             self._record_usage("printers_refresh_requested")
             if not self.on_refresh_printers:
@@ -672,7 +742,7 @@ class PrintServer:
                 raise HTTPException(status_code=500, detail=str(e))
 
         @app.post("/printers/clear")
-        async def clear_printers_cache_endpoint():
+        def clear_printers_cache_endpoint():
             """Clear the persistent printer cache."""
             self._record_usage("printers_clear_requested")
             if not self.on_clear_printer_cache:
@@ -682,6 +752,193 @@ class PrintServer:
                 return result
             except Exception as e:
                 logger.error("Error clearing printer cache: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/printers/config/schema")
+        def get_printer_config_schema_endpoint():
+            """Get the complete schema of configurable printer options, data types, and accepted choices."""
+            self._record_usage("printer_config_schema_requested")
+            if not self.on_get_config_schema:
+                raise HTTPException(status_code=500, detail="Config schema handler not configured")
+            return self.on_get_config_schema()
+
+        @app.get("/printers/config")
+        @app.get("/printers/{target:path}/config")
+        def get_printer_config_endpoint(
+            target: Optional[str] = None,
+            printer_ip: Optional[str] = None,
+            printer_mac: Optional[str] = None,
+            printer_name: Optional[str] = None,
+        ):
+            """Get live hardware configuration from a Zebra printer (resolution, print method, label size, etc.)."""
+            resolved_target = (target or printer_ip or printer_mac or printer_name or "").strip()
+            if not resolved_target or resolved_target == "schema":
+                raise HTTPException(status_code=400, detail="Target printer (name, IP, or MAC) is required")
+            self._record_usage("printer_config_get_requested", target=resolved_target)
+            if not self.on_get_printer_config:
+                raise HTTPException(status_code=500, detail="Printer config handler not configured")
+            try:
+                result = self.on_get_printer_config(resolved_target)
+                server_hostname = get_hostname()
+                return {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except ValueError as e:
+                raise HTTPException(status_code=404, detail=str(e))
+            except ConnectionError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+            except Exception as e:
+                logger.error("Error getting printer config for '%s': %s", resolved_target, e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/printers/config")
+        @app.post("/printers/{target:path}/config")
+        def set_printer_config_endpoint(
+            config_data: PrinterConfigUpdateModel,
+            target: Optional[str] = None,
+        ):
+            """Update hardware configuration on a Zebra printer via SGD without printing."""
+            resolved_target = (target or config_data.target or "").strip()
+            if not resolved_target:
+                raise HTTPException(status_code=400, detail="Target printer (name, IP, or MAC) is required")
+
+            settings = {
+                k: v for k, v in config_data.model_dump().items()
+                if k != "target" and v is not None
+            }
+            if not settings:
+                raise HTTPException(status_code=400, detail="At least one configuration field must be provided")
+
+            self._record_usage("printer_config_set_requested", target=resolved_target)
+            if not self.on_set_printer_config:
+                raise HTTPException(status_code=500, detail="Printer config handler not configured")
+            try:
+                result = self.on_set_printer_config(resolved_target, settings)
+                server_hostname = get_hostname()
+                return {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except ValueError as e:
+                raise HTTPException(status_code=400, detail=str(e))
+            except ConnectionError as e:
+                raise HTTPException(status_code=503, detail=str(e))
+            except Exception as e:
+                logger.error("Error setting printer config for '%s': %s", resolved_target, e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/subnets")
+        def get_subnets_endpoint(scan: bool = False, clear_cache: bool = False):
+            """Get all available network interface subnets and custom subnets. Pass ?scan=true to also scan."""
+            self._record_usage("subnets_requested", scan=scan)
+            if not self.on_get_subnets:
+                raise HTTPException(status_code=500, detail="Subnet handler not configured")
+            try:
+                subnets_info = self.on_get_subnets()
+                server_hostname = get_hostname()
+                response = {
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **subnets_info,
+                }
+                if scan and self.on_scan_subnets:
+                    scan_result = self.on_scan_subnets(clear_cache=clear_cache)
+                    response["scan_result"] = scan_result
+                return response
+            except Exception as e:
+                logger.error("Error getting subnets: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/subnets/scan")
+        @app.post("/subnets/scan")
+        def scan_subnets_endpoint(subnet: Optional[str] = None, clear_cache: bool = False):
+            """Scan all available subnets or a specific subnet for Zebra printers."""
+            self._record_usage("subnets_scan_requested", subnet=subnet)
+            if not self.on_scan_subnets:
+                raise HTTPException(status_code=500, detail="Subnet scan handler not configured")
+            try:
+                result = self.on_scan_subnets(subnet=subnet, clear_cache=clear_cache)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Subnet scan completed for {subnet or 'all available subnets'}",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    **result,
+                }
+            except Exception as e:
+                logger.error("Error scanning subnets: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/subnets")
+        def add_custom_subnet_endpoint(request_data: Optional[SubnetRequest] = None, subnet: Optional[str] = None):
+            """Add a custom subnet (e.g. '10.0.1.0/24') to configuration."""
+            target_subnet = (request_data.subnet if request_data and request_data.subnet else subnet or "").strip()
+            if not target_subnet:
+                raise HTTPException(status_code=400, detail="Field 'subnet' is required (e.g. '10.0.1.0/24')")
+            try:
+                import ipaddress
+                ipaddress.IPv4Network(target_subnet, strict=False)
+            except Exception as e:
+                raise HTTPException(status_code=400, detail=f"Invalid IPv4 subnet format: {e}")
+
+            self._record_usage("subnet_add_requested", subnet=target_subnet)
+            if not self.on_add_custom_subnet:
+                raise HTTPException(status_code=500, detail="Add subnet handler not configured")
+            try:
+                updated_info = self.on_add_custom_subnet(target_subnet)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Custom subnet '{target_subnet}' added successfully",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    "added_subnet": target_subnet,
+                    **updated_info,
+                }
+            except Exception as e:
+                logger.error("Error adding custom subnet: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.delete("/subnets")
+        def remove_custom_subnet_endpoint(subnet: str):
+            """Remove a custom subnet from configuration."""
+            target_subnet = (subnet or "").strip()
+            if not target_subnet:
+                raise HTTPException(status_code=400, detail="Query parameter 'subnet' is required")
+            self._record_usage("subnet_remove_requested", subnet=target_subnet)
+            if not self.on_remove_custom_subnet:
+                raise HTTPException(status_code=500, detail="Remove subnet handler not configured")
+            try:
+                updated_info = self.on_remove_custom_subnet(target_subnet)
+                server_hostname = get_hostname()
+                return {
+                    "success": True,
+                    "message": f"Custom subnet '{target_subnet}' removed successfully",
+                    "server_hostname": server_hostname,
+                    "hostname": server_hostname,
+                    "removed_subnet": target_subnet,
+                    **updated_info,
+                }
+            except Exception as e:
+                logger.error("Error removing custom subnet: %s", e)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.get("/api/server/sync")
+        @app.post("/api/server/sync")
+        def sync_server_endpoint():
+            """Manually trigger synchronization of this server with NetSuite Suitelet."""
+            self._record_usage("server_sync_requested")
+            if not self.on_server_sync:
+                raise HTTPException(status_code=501, detail="Server sync handler not configured")
+            try:
+                res = self.on_server_sync()
+                return res
+            except Exception as e:
+                logger.error("Error syncing server: %s", e)
                 raise HTTPException(status_code=500, detail=str(e))
 
         return app

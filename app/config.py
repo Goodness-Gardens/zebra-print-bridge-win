@@ -4,7 +4,7 @@ import copy
 import json
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -23,6 +23,17 @@ class Config:
         'saved_printers': [],
         'printer_aliases': {},
         'custom_subnets': ['192.168.0.0/22'],
+        'verify_identity': True,
+        'strict_identity': False,
+        'discovery_broadcast': False,
+        'suitelet_sync_enabled': False,
+        'suitelet_sync_url': '',
+        'suitelet_account_id': '1224776-sb1',
+        'suitelet_compid': '1224776-sb1',
+        'suitelet_sync_hash': '',
+        'suitelet_sync_interval_seconds': 0,
+        'server_name': '',
+        'server_priority': None,
     }
 
     def __init__(self, config_path: str = None):
@@ -101,6 +112,108 @@ class Config:
     @custom_subnets.setter
     def custom_subnets(self, value: List[str]):
         self._config['custom_subnets'] = value
+        self._save()
+
+    def add_custom_subnet(self, subnet: str) -> List[str]:
+        subnets = list(self.custom_subnets)
+        if subnet not in subnets:
+            subnets.append(subnet)
+            self.custom_subnets = subnets
+        return self.custom_subnets
+
+    def remove_custom_subnet(self, subnet: str) -> List[str]:
+        subnets = [s for s in self.custom_subnets if s != subnet]
+        self.custom_subnets = subnets
+        return self.custom_subnets
+
+    @property
+    def verify_identity(self) -> bool:
+        return bool(self._config.get('verify_identity', True))
+
+    @verify_identity.setter
+    def verify_identity(self, value: bool):
+        self._config['verify_identity'] = value
+        self._save()
+
+    @property
+    def strict_identity(self) -> bool:
+        return bool(self._config.get('strict_identity', False))
+
+    @strict_identity.setter
+    def strict_identity(self, value: bool):
+        self._config['strict_identity'] = value
+        self._save()
+
+    @property
+    def suitelet_sync_enabled(self) -> bool:
+        return bool(self._config.get('suitelet_sync_enabled', False))
+
+    @suitelet_sync_enabled.setter
+    def suitelet_sync_enabled(self, value: bool):
+        self._config['suitelet_sync_enabled'] = value
+        self._save()
+
+    @property
+    def suitelet_sync_url(self) -> str:
+        return self._config.get('suitelet_sync_url', '')
+
+    @suitelet_sync_url.setter
+    def suitelet_sync_url(self, value: str):
+        self._config['suitelet_sync_url'] = value
+        self._save()
+
+    @property
+    def suitelet_account_id(self) -> str:
+        return self._config.get('suitelet_account_id', '1224776-sb1')
+
+    @suitelet_account_id.setter
+    def suitelet_account_id(self, value: str):
+        self._config['suitelet_account_id'] = value
+        self._save()
+
+    @property
+    def suitelet_compid(self) -> str:
+        return self._config.get('suitelet_compid', '1224776-sb1')
+
+    @suitelet_compid.setter
+    def suitelet_compid(self, value: str):
+        self._config['suitelet_compid'] = value
+        self._save()
+
+    @property
+    def suitelet_sync_hash(self) -> str:
+        return self._config.get('suitelet_sync_hash', '')
+
+    @suitelet_sync_hash.setter
+    def suitelet_sync_hash(self, value: str):
+        self._config['suitelet_sync_hash'] = value
+        self._save()
+
+    @property
+    def suitelet_sync_interval_seconds(self) -> int:
+        return int(self._config.get('suitelet_sync_interval_seconds', 0) or 0)
+
+    @suitelet_sync_interval_seconds.setter
+    def suitelet_sync_interval_seconds(self, value: int):
+        self._config['suitelet_sync_interval_seconds'] = int(value or 0)
+        self._save()
+
+    @property
+    def server_name(self) -> str:
+        return self._config.get('server_name', '')
+
+    @server_name.setter
+    def server_name(self, value: str):
+        self._config['server_name'] = value
+        self._save()
+
+    @property
+    def server_priority(self) -> Optional[int]:
+        return self._config.get('server_priority', None)
+
+    @server_priority.setter
+    def server_priority(self, value: Optional[int]):
+        self._config['server_priority'] = value
         self._save()
 
     def get(self, key: str, default=None):

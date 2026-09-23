@@ -7,11 +7,44 @@ import platform
 import re
 import socket
 import subprocess
+import threading
+import time
 import uuid
 from pathlib import Path
-from typing import Optional, Tuple, Dict
+from typing import Optional, Tuple, Dict, List
 
 HOSTNAME_LABEL_REGEX = re.compile(r"^[a-zA-Z0-9]([a-zA-Z0-9_-]{0,61}[a-zA-Z0-9])?$")
+
+
+def run_command(cmd: List[str], timeout: float = 5.0) -> str:
+    """
+    Run a system command safely and return its stdout as a string.
+    - On Windows, uses creationflags=subprocess.CREATE_NO_WINDOW to avoid flashing console windows.
+    - Captures bytes and decodes with errors='ignore' (resilient to localized output/accents).
+    - stderr is suppressed via DEVNULL.
+    - Times out after timeout seconds.
+    - Returns empty string on any failure/timeout/exception.
+    """
+    kwargs = {
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.DEVNULL,
+        "timeout": timeout,
+    }
+    if platform.system() == "Windows":
+        kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
+    try:
+        proc = subprocess.run(cmd, **kwargs)
+        if proc.stdout:
+            return proc.stdout.decode("utf-8", errors="ignore")
+        return ""
+    except Exception:
+        return ""
+
+
+_local_mac_cache: Dict[str, Tuple[Optional[str], float]] = {}
+_local_mac_lock = threading.Lock()
+LOCAL_MAC_CACHE_TTL = 60.0
 
 
 def get_local_ip() -> Optional[str]:
@@ -134,11 +167,8 @@ def is_valid_mac(mac: str) -> bool:
     return normalize_mac(mac) is not None
 
 
-def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
-    """
-    Get the MAC address of the local machine, preferably matching the provided IP
-    (or default network IP) for the active network interface.
-    """
+def _resolve_local_mac(ip: Optional[str] = None) -> Optional[str]:
+    """Inner resolution for local machine MAC address using system tools."""
     if not ip:
         ip = get_local_ip()
 
@@ -147,7 +177,7 @@ def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
     # 1. macOS / Linux: Try ifconfig
     if system in ("Darwin", "Linux"):
         try:
-            out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
+            out = run_command(["ifconfig"])
             blocks = re.split(r"\n(?=[a-zA-Z0-9_-]+:)", out)
             matched_mac = None
             first_active_mac = None
@@ -181,7 +211,7 @@ def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
     if system == "Linux":
         try:
             if ip:
-                out = subprocess.check_output(["ip", "-o", "addr", "show"], text=True, stderr=subprocess.DEVNULL)
+                out = run_command(["ip", "-o", "addr", "show"])
                 for line in out.splitlines():
                     if ip in line:
                         parts = line.split()
@@ -198,7 +228,7 @@ def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
     # 3. Windows: Try ipconfig /all
     if system == "Windows":
         try:
-            out = subprocess.check_output(["ipconfig", "/all"], text=True, stderr=subprocess.DEVNULL)
+            out = run_command(["ipconfig", "/all"])
             blocks = re.split(r"\n(?=[^\s].*?:)", out)
             matched_mac = None
             first_active_mac = None
@@ -230,6 +260,9 @@ def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
     # 4. Fallback: uuid.getnode()
     try:
         node = uuid.getnode()
+        # Discard if multicast bit is set (bit 40), indicating a pseudo-random MAC
+        if (node >> 40) & 1 == 1:
+            return None
         mac_hex = f"{node:012X}"
         if len(mac_hex) == 12:
             return normalize_mac(mac_hex)
@@ -237,6 +270,30 @@ def get_local_mac(ip: Optional[str] = None) -> Optional[str]:
         pass
 
     return None
+
+
+def get_local_mac(ip: Optional[str] = None, use_cache: bool = True) -> Optional[str]:
+    """
+    Get the MAC address of the local machine, preferably matching the provided IP
+    (or default network IP) for the active network interface.
+    Cached in memory with a 60-second TTL.
+    """
+    now = time.time()
+    cache_key = ip or ""
+    if use_cache:
+        with _local_mac_lock:
+            if cache_key in _local_mac_cache:
+                cached_mac, ts = _local_mac_cache[cache_key]
+                if now - ts < LOCAL_MAC_CACHE_TTL:
+                    return cached_mac
+
+    mac = _resolve_local_mac(ip)
+
+    if use_cache:
+        with _local_mac_lock:
+            _local_mac_cache[cache_key] = (mac, now)
+
+    return mac
 
 
 def get_mac_for_ip(ip: str) -> str:
@@ -249,7 +306,7 @@ def get_mac_for_ip(ip: str) -> str:
             return local_mac
     cmd = ["arp", "-an"] if platform.system() in ("Darwin", "Linux") else ["arp", "-a"]
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        out = run_command(cmd)
         for line in out.splitlines():
             if ip in line:
                 m = re.search(r"([0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2})", line)
@@ -274,7 +331,7 @@ def get_ip_for_mac(mac: str) -> str:
             return local_ip
     cmd = ["arp", "-an"] if platform.system() in ("Darwin", "Linux") else ["arp", "-a"]
     try:
-        out = subprocess.check_output(cmd, text=True, stderr=subprocess.DEVNULL)
+        out = run_command(cmd)
         for line in out.splitlines():
             m_ip = re.search(r"(\d+\.\d+\.\d+\.\d+)", line)
             m_mac = re.search(r"([0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2}[:-][0-9a-fA-F]{1,2})", line)

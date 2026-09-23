@@ -1,5 +1,5 @@
 {
-  "version": "1.2.0",
-  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.2.0/ZebraBridgeSetup_1.2.0.exe",
-  "notes": "Added GUI scanned network printers (hostname & IP) and local Windows devices list; removed unused code and dependencies."
+  "version": "1.3.0",
+  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.3.0/ZebraBridgeSetup_1.3.0.exe",
+  "notes": "Added NetSuite Suitelet server synchronization with background heartbeat and on-demand sync."
 }

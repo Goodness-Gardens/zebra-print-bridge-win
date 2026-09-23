@@ -311,7 +311,22 @@ class ZebraBridgeApp(ctk.CTk):
         self.update_link.bind("<Button-1>", lambda e: self._manual_check_updates())
         self.update_link.bind("<Enter>", lambda e: self.update_link.configure(font=ctk.CTkFont(size=11, underline=True)))
         self.update_link.bind("<Leave>", lambda e: self.update_link.configure(font=ctk.CTkFont(size=11, underline=False)))
-        self.update_link.pack(side="right", padx=(8, 0))
+        self.update_link.pack(side="right", padx=(6, 0))
+
+        ctk.CTkLabel(
+            footer, text="•",
+            font=ctk.CTkFont(size=11), text_color=TEXT_DIM,
+        ).pack(side="right", padx=6)
+
+        self.sync_netsuite_link = ctk.CTkLabel(
+            footer, text="Sync NetSuite",
+            font=ctk.CTkFont(size=11), text_color=ACCENT,
+            cursor="hand2"
+        )
+        self.sync_netsuite_link.bind("<Button-1>", lambda e: self._manual_sync_netsuite())
+        self.sync_netsuite_link.bind("<Enter>", lambda e: self.sync_netsuite_link.configure(font=ctk.CTkFont(size=11, underline=True)))
+        self.sync_netsuite_link.bind("<Leave>", lambda e: self.sync_netsuite_link.configure(font=ctk.CTkFont(size=11, underline=False)))
+        self.sync_netsuite_link.pack(side="right", padx=(6, 0))
 
         ctk.CTkLabel(
             footer, text=f"v{__version__}  •",
@@ -344,7 +359,9 @@ class ZebraBridgeApp(ctk.CTk):
                     if clear_cache:
                         self._append_log_safe("[INFO] Clearing printer cache...")
                         self.bridge.printer_manager.clear_cache()
-                    self._append_log_safe("[INFO] Scanning current network for Zebra printers...")
+                    subnets_info = self.bridge.get_subnets()
+                    active_subnets = subnets_info.get("all_subnets", [])
+                    self._append_log_safe(f"[INFO] Scanning subnets {active_subnets} for Zebra printers...")
                     self.bridge.printer_manager.scan_subnet(clear_cache=clear_cache)
                     self._append_log_safe("[INFO] Network scan completed.")
                 else:
@@ -415,9 +432,13 @@ class ZebraBridgeApp(ctk.CTk):
         ).pack(side="left")
 
         # Status badge
+        is_offline = (p.get("status") == "offline") or not (p.get("address") or p.get("ip"))
+        status_text = "● Offline" if is_offline else "● Online"
+        status_color = RED if is_offline else GREEN
+
         ctk.CTkLabel(
-            top_row, text="● Online",
-            font=ctk.CTkFont(size=11, weight="bold"), text_color=GREEN,
+            top_row, text=status_text,
+            font=ctk.CTkFont(size=11, weight="bold"), text_color=status_color,
         ).pack(side="right")
 
         # Hostname & IP details
@@ -427,11 +448,13 @@ class ZebraBridgeApp(ctk.CTk):
         hostname = p.get("hostname") or "—"
         ip = p.get("address") or p.get("ip") or ""
         port = p.get("port", 9100)
-        mac = p.get("mac_address") or "—"
+        mac = p.get("mac_address") or p.get("mac") or "—"
+        mac_source = p.get("mac_source")
 
         if mac and mac != "—":
+            mac_display = f"MAC:  {mac} ({mac_source})" if mac_source else f"MAC:  {mac}"
             ctk.CTkLabel(
-                info_frame, text=f"MAC:  {mac}",
+                info_frame, text=mac_display,
                 font=ctk.CTkFont(family="Consolas", size=12, weight="bold"), text_color=TEXT_MAIN,
             ).pack(anchor="w")
 
@@ -440,8 +463,13 @@ class ZebraBridgeApp(ctk.CTk):
             font=ctk.CTkFont(size=12), text_color=TEXT_DIM,
         ).pack(anchor="w")
 
+        if is_offline or not ip:
+            ip_display = "IP:  last known IP unknown"
+        else:
+            ip_display = f"IP:  {ip}:{port}"
+
         ctk.CTkLabel(
-            info_frame, text=f"IP:  {ip}:{port}",
+            info_frame, text=ip_display,
             font=ctk.CTkFont(family="Consolas", size=12), text_color=TEXT_MAIN,
         ).pack(anchor="w", pady=(1, 6))
 
@@ -459,22 +487,26 @@ class ZebraBridgeApp(ctk.CTk):
             copy_mac_btn.configure(command=lambda m=mac, b=copy_mac_btn: self._copy_to_clipboard(m, b, "📋 Copy MAC"))
             copy_mac_btn.pack(side="left", padx=(0, 6))
 
-        copy_btn = ctk.CTkButton(
-            btn_row, text="📋 Copy IP", width=95, height=26,
-            font=ctk.CTkFont(size=11),
-            fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
-            corner_radius=6,
-        )
-        copy_btn.configure(command=lambda i=ip, b=copy_btn: self._copy_to_clipboard(i, b, "📋 Copy IP"))
-        copy_btn.pack(side="left", padx=(0, 6))
+        if not is_offline and ip:
+            copy_btn = ctk.CTkButton(
+                btn_row, text="📋 Copy IP", width=95, height=26,
+                font=ctk.CTkFont(size=11),
+                fg_color="#e2e8f0", hover_color="#cbd5e1", text_color=TEXT_MAIN,
+                corner_radius=6,
+            )
+            copy_btn.configure(command=lambda i=ip, b=copy_btn: self._copy_to_clipboard(i, b, "📋 Copy IP"))
+            copy_btn.pack(side="left", padx=(0, 6))
 
         test_btn = ctk.CTkButton(
             btn_row, text="🔌 Test", width=80, height=26,
             font=ctk.CTkFont(size=11),
-            fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            fg_color=ACCENT if not is_offline else "#cbd5e1",
+            hover_color=ACCENT_HOVER if not is_offline else "#cbd5e1",
+            state="normal" if not is_offline else "disabled",
             corner_radius=6,
         )
-        test_btn.configure(command=lambda: self._test_network_printer(p, test_btn))
+        if not is_offline:
+            test_btn.configure(command=lambda: self._test_network_printer(p, test_btn))
         test_btn.pack(side="left")
 
     def _create_local_printer_card(self, p: Dict):
@@ -694,6 +726,30 @@ class ZebraBridgeApp(ctk.CTk):
                 self._append_log("[INFO] Update check complete: You are already on the latest version or no update found.")
 
         check_for_updates_async(_on_result)
+
+    def _manual_sync_netsuite(self):
+        if not self.bridge or not self.server_running:
+            self._append_log("[WARNING] Cannot sync NetSuite: Server is not running.")
+            return
+
+        self.sync_netsuite_link.configure(text="Syncing...")
+        self._append_log("[INFO] Triggering manual NetSuite Suitelet server synchronization...")
+
+        def _worker():
+            try:
+                res = self.bridge.sync_server_to_suitelet()
+                success = res.get("success", False)
+                msg = res.get("message", "")
+                if success:
+                    self._append_log_safe(f"[INFO] NetSuite Sync Success: {msg}")
+                else:
+                    self._append_log_safe(f"[WARNING] NetSuite Sync Failed: {msg}")
+            except Exception as exc:
+                self._append_log_safe(f"[ERROR] NetSuite Sync Exception: {exc}")
+            finally:
+                self.after(2000, lambda: self.sync_netsuite_link.configure(text="Sync NetSuite"))
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_update_check_result(self, info):
         """Called from updater thread; schedule on main thread."""

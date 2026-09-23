@@ -1,10 +1,14 @@
 """
 Printer Manager for Zebra printers
-Handles communication via Network (TCP/IP) and local OS-installed printers
-(win32print on Windows).
+Handles communication via Network (TCP/IP port 9100) and local OS-installed printers
+(win32print on Windows, CUPS on macOS/Linux).
+Also provides single-pass target resolution (MAC / IP / hostname / alias / OS printer),
+SNMP + ARP identity verification, passive subnet discovery and the persistent
+identity-indexed printer cache (network_printers.json, v2).
 """
 
 import concurrent.futures
+from dataclasses import dataclass
 from datetime import datetime
 import ipaddress
 import json
@@ -27,7 +31,27 @@ from .utils import (
     normalize_mac,
     get_mac_for_ip,
     get_ip_for_mac,
+    parse_target_address_port,
+    run_command,
 )
+
+
+@dataclass
+class ResolvedTarget:
+    """Represents a unified resolved printer target."""
+    mac: Optional[str] = None
+    serial: Optional[str] = None
+    ip: Optional[str] = None
+    port: int = 9100
+    source: Optional[str] = None  # "hint", "cache", "arp", "snmp", "dns", "mdns", "discovery", "manual", "local", "default_local", "test"
+    message: Optional[str] = None
+    reachable: bool = False
+    printer_name: Optional[str] = None
+    use_local: bool = False
+    verified: bool = False
+    verification: str = "unverifiable"  # "match", "mismatch", "unverifiable"
+    resolved: bool = True
+    host: Optional[str] = None
 
 # Conditional import for Windows printing
 _win32print = None
@@ -40,30 +64,105 @@ if platform.system() == "Windows":
 logger = logging.getLogger(__name__)
 
 
-def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> str:
-    """Query an SNMPv1/v2c OID on UDP port 161 (100% passive to port 9100, zero print bytes)."""
+def _parse_ber_length(data: bytes, offset: int) -> Tuple[int, int]:
+    """
+    Parse ASN.1 BER length starting at data[offset].
+    Returns (length, new_offset_after_length_bytes).
+    """
+    if offset >= len(data):
+        return 0, offset
+    first = data[offset]
+    if (first & 0x80) == 0:
+        return first, offset + 1
+    num_bytes = first & 0x7F
+    if num_bytes == 0 or offset + 1 + num_bytes > len(data):
+        return 0, offset + 1
+    val = 0
+    for b in data[offset + 1 : offset + 1 + num_bytes]:
+        val = (val << 8) | b
+    return val, offset + 1 + num_bytes
+
+
+def _build_snmp_packet(oid_list: List[int], pdu_type: int = 0xA0) -> bytes:
+    """Build SNMPv1 packet for a given OID (0xA0 = GetRequest, 0xA1 = GetNextRequest)."""
+    oid_bytes = bytearray([oid_list[0] * 40 + oid_list[1]])
+    for val in oid_list[2:]:
+        if val < 128:
+            oid_bytes.append(val)
+        else:
+            parts = []
+            while val > 0:
+                parts.append(val & 0x7F)
+                val >>= 7
+            for i in range(len(parts) - 1, 0, -1):
+                oid_bytes.append(parts[i] | 0x80)
+            oid_bytes.append(parts[0])
+
+    comm_bytes = b"public"
+    varbind = b"\x30" + bytes([len(oid_bytes) + 4]) + b"\x06" + bytes([len(oid_bytes)]) + bytes(oid_bytes) + b"\x05\x00"
+    varbind_list = b"\x30" + bytes([len(varbind)]) + varbind
+    pdu_payload = b"\x02\x01\x01\x02\x01\x00\x02\x01\x00" + varbind_list
+    pdu = bytes([pdu_type]) + bytes([len(pdu_payload)]) + pdu_payload
+    msg_payload = b"\x02\x01\x00\x04" + bytes([len(comm_bytes)]) + comm_bytes + pdu
+    return b"\x30" + bytes([len(msg_payload)]) + msg_payload
+
+
+# In-memory cache for IPs confirmed to not respond to SNMP (10-minute TTL)
+_no_snmp_cache: Dict[str, float] = {}
+_no_snmp_lock = threading.Lock()
+
+
+def _is_ip_no_snmp(ip: str) -> bool:
+    """Check if IP is known to not respond to SNMP within TTL window."""
+    with _no_snmp_lock:
+        exp = _no_snmp_cache.get(ip)
+        if exp:
+            if time.time() < exp:
+                return True
+            _no_snmp_cache.pop(ip, None)
+    return False
+
+
+def _mark_ip_no_snmp(ip: str, ttl: float = 600.0) -> None:
+    """Mark an IP as non-responsive to SNMP for ttl seconds (default 10 minutes)."""
+    with _no_snmp_lock:
+        _no_snmp_cache[ip] = time.time() + ttl
+
+
+def _clear_no_snmp_cache() -> None:
+    """Clear the in-memory no-SNMP IP cache (primarily for tests)."""
+    with _no_snmp_lock:
+        _no_snmp_cache.clear()
+
+
+# Set of IP addresses for which an identity unverifiable warning has already been logged
+_warned_unverifiable_ips: set = set()
+_warned_ips_lock = threading.Lock()
+
+
+def _log_unverifiable_once(ip: str) -> None:
+    """Log a warning once per IP when identity cannot be verified."""
+    with _warned_ips_lock:
+        if ip not in _warned_unverifiable_ips:
+            _warned_unverifiable_ips.add(ip)
+            logger.warning(
+                "Device at IP '%s' could not be verified (no SNMP/ARP response). Proceeding in fail-open mode.",
+                ip,
+            )
+
+
+def _clear_warned_unverifiable_ips() -> None:
+    """Clear the set of warned unverifiable IPs (for testing)."""
+    with _warned_ips_lock:
+        _warned_unverifiable_ips.clear()
+
+
+def _query_snmp_raw(ip: str, oid_list: List[int], timeout: float = 0.3, pdu_type: int = 0xA0) -> Optional[bytes]:
+    """Query an SNMPv1 OID on UDP port 161 and return the raw byte payload of the OCTET STRING varbind."""
+    if _is_ip_no_snmp(ip):
+        return None
     try:
-        oid_bytes = bytearray([oid_list[0] * 40 + oid_list[1]])
-        for val in oid_list[2:]:
-            if val < 128:
-                oid_bytes.append(val)
-            else:
-                parts = []
-                while val > 0:
-                    parts.append(val & 0x7F)
-                    val >>= 7
-                for i in range(len(parts) - 1, 0, -1):
-                    oid_bytes.append(parts[i] | 0x80)
-                oid_bytes.append(parts[0])
-
-        comm_bytes = b"public"
-        varbind = b"\x30" + bytes([len(oid_bytes) + 4]) + b"\x06" + bytes([len(oid_bytes)]) + bytes(oid_bytes) + b"\x05\x00"
-        varbind_list = b"\x30" + bytes([len(varbind)]) + varbind
-        pdu_payload = b"\x02\x01\x01\x02\x01\x00\x02\x01\x00" + varbind_list
-        pdu = b"\xa0" + bytes([len(pdu_payload)]) + pdu_payload
-        msg_payload = b"\x02\x01\x00\x04" + bytes([len(comm_bytes)]) + comm_bytes + pdu
-        pkt = b"\x30" + bytes([len(msg_payload)]) + msg_payload
-
+        pkt = _build_snmp_packet(oid_list, pdu_type=pdu_type)
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         s.settimeout(timeout)
         try:
@@ -73,15 +172,93 @@ def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> st
             if pdu_idx != -1:
                 oid_idx = data.find(b"\x06", pdu_idx)
                 if oid_idx != -1:
-                    oid_len = data[oid_idx + 1]
-                    val_idx = oid_idx + 2 + oid_len
-                    if val_idx < len(data) and data[val_idx] == 0x04:
-                        val_len = data[val_idx + 1]
-                        return data[val_idx + 2 : val_idx + 2 + val_len].decode("utf-8", errors="ignore").strip()
+                    oid_len, val_start = _parse_ber_length(data, oid_idx + 1)
+                    val_idx = val_start + oid_len
+                    if val_idx < len(data) and data[val_idx] == 0x04:  # OCTET STRING
+                        val_len, content_start = _parse_ber_length(data, val_idx + 1)
+                        if content_start + val_len <= len(data):
+                            return data[content_start : content_start + val_len]
         finally:
             s.close()
+    except (socket.timeout, TimeoutError):
+        _mark_ip_no_snmp(ip)
     except Exception:
         pass
+    return None
+
+
+def _query_snmp_string(ip: str, oid_list: List[int], timeout: float = 0.3) -> str:
+    """Query an SNMPv1/v2c OID on UDP port 161 (100% passive to port 9100, zero print bytes)."""
+    raw = _query_snmp_raw(ip, oid_list, timeout=timeout, pdu_type=0xA0)
+    if raw:
+        return raw.decode("utf-8", errors="ignore").strip()
+    return ""
+
+
+def _format_mac_bytes(raw_mac: bytes) -> Optional[str]:
+    """Validate and format 6 raw MAC bytes into standard uppercase 'AA:BB:CC:DD:EE:FF'."""
+    if not raw_mac or len(raw_mac) != 6:
+        return None
+    # Discard if all zeros (00:00:00:00:00:00)
+    if not any(b != 0 for b in raw_mac):
+        return None
+    return ":".join(f"{b:02X}" for b in raw_mac)
+
+
+def _query_snmp_mac(ip: str, timeout: float = 0.3) -> Optional[str]:
+    """
+    Query interface physical MAC address (ifPhysAddress) via SNMP UDP port 161.
+    Tries:
+    1. GETNEXT on 1.3.6.1.2.1.2.2.1.6 (PDU 0xA1)
+    2. GET on ifIndex 1..4 (1.3.6.1.2.1.2.2.1.6.1 .. 4)
+    Returns first valid 6-byte non-zero MAC formatted as 'AA:BB:CC:DD:EE:FF', or None.
+    If the first query times out without response, marks IP as no-snmp and aborts immediately.
+    """
+    if _is_ip_no_snmp(ip):
+        return None
+
+    if_phys_base = [1, 3, 6, 1, 2, 1, 2, 2, 1, 6]
+
+    # 1. Try GETNEXT on base table
+    raw_next = _query_snmp_raw(ip, if_phys_base, timeout=timeout, pdu_type=0xA1)
+    if raw_next:
+        formatted = _format_mac_bytes(raw_next)
+        if formatted:
+            return formatted
+
+    # If first query timed out or IP was marked no-snmp, do not perform subsequent queries
+    if _is_ip_no_snmp(ip):
+        return None
+
+    # 2. Try GET on ifIndex 1 through 4
+    for idx in (1, 2, 3, 4):
+        raw = _query_snmp_raw(ip, if_phys_base + [idx], timeout=timeout, pdu_type=0xA0)
+        if raw:
+            formatted = _format_mac_bytes(raw)
+            if formatted:
+                return formatted
+        if _is_ip_no_snmp(ip):
+            return None
+
+    return None
+
+
+def get_identity_key(mac: Optional[str] = None, serial: Optional[str] = None, ip: Optional[str] = None) -> str:
+    """
+    Generate cache identity key:
+    1. Normalized MAC ('AA:BB:CC:DD:EE:FF') if present
+    2. 'serial:<serial>' if serial present
+    3. 'ip:<ip>' if only IP present
+    """
+    norm_mac = normalize_mac(mac) if mac else None
+    if norm_mac:
+        return norm_mac
+    clean_serial = (serial or "").strip()
+    if clean_serial:
+        return f"serial:{clean_serial}"
+    clean_ip = (ip or "").strip()
+    if clean_ip:
+        return f"ip:{clean_ip}"
     return ""
 
 
@@ -140,8 +317,21 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
     except Exception:
         pass
 
-    # 4. Resolve MAC address via OS ARP table (instant, safe)
-    mac_address = get_mac_for_ip(ip)
+    # 4. Resolve MAC address: SNMP ifPhysAddress > OS ARP table
+    mac_address = ""
+    mac_source = None
+
+    # Priority 1: SNMP ifPhysAddress (UDP 161, works across routers & VPNs)
+    snmp_mac = _query_snmp_mac(ip, timeout=0.3)
+    if snmp_mac:
+        mac_address = snmp_mac
+        mac_source = "snmp"
+    else:
+        # Priority 2: OS ARP table (local subnet fallback)
+        arp_mac = get_mac_for_ip(ip)
+        if arp_mac:
+            mac_address = arp_mac
+            mac_source = "arp"
 
     # 5. Fallback to SNMP sysName / Zebra Enterprise MIB on UDP port 161
     unique_id = ""
@@ -166,33 +356,271 @@ def probe_zebra_printer(ip: str, timeout: float = 0.6) -> Optional[Dict]:
         "hostname": hostname,
         "ip": ip,
         "port": 9100,
-        "unique_id": unique_id,
-        "mac_address": mac_address,
+        "mac": mac_address or None,
+        "mac_address": mac_address or "",
+        "serial": unique_id or None,
+        "unique_id": unique_id or "",
+        "mac_source": mac_source,
         "last_seen": datetime.now().isoformat(),
+    }
+
+
+def parse_windows_ipconfig(text: str) -> List[Dict]:
+    """Parse Windows ipconfig /all output supporting both English and Spanish."""
+    results = []
+    current_adapter = "Ethernet"
+    current_ip = None
+    for line in text.splitlines():
+        adapter_match = re.match(
+            r"^\s*(?:[A-Za-z0-9_\-\.\s]+adapter|Adaptador[A-Za-z0-9_\-\.\s]+)\s+([^:\r\n]+):",
+            line,
+            re.IGNORECASE,
+        )
+        if adapter_match:
+            current_adapter = adapter_match.group(1).strip()
+            current_ip = None
+            continue
+
+        ip_match = re.search(
+            r"(?:IPv4|Direcci[oó]n\s*IPv4)[^:]*:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+            line,
+            re.IGNORECASE,
+        )
+        if ip_match:
+            current_ip = ip_match.group(1).strip()
+            continue
+
+        mask_match = re.search(
+            r"(?:Subnet\s*Mask|M[aá]scara\s*de\s*subred)[^:]*:\s*([0-9]{1,3}(?:\.[0-9]{1,3}){3})",
+            line,
+            re.IGNORECASE,
+        )
+        if mask_match and current_ip:
+            mask = mask_match.group(1).strip()
+            if not current_ip.startswith("127.") and not current_ip.startswith("169.254."):
+                try:
+                    net = ipaddress.IPv4Network(f"{current_ip}/{mask}", strict=False)
+                    if 8 <= net.prefixlen <= 30:
+                        results.append({
+                            "interface": current_adapter,
+                            "ip": current_ip,
+                            "netmask": mask,
+                            "cidr": str(net),
+                            "prefix_len": net.prefixlen,
+                            "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                        })
+                except Exception:
+                    pass
+            current_ip = None
+    return results
+
+
+def get_windows_subnets_powershell() -> List[Dict]:
+    """Query Windows network adapters via PowerShell Get-NetIPAddress."""
+    try:
+        cmd = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            "Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.InterfaceAlias -notmatch 'Loopback' } | Select-Object InterfaceAlias,IPAddress,PrefixLength | ConvertTo-Json",
+        ]
+        out = run_command(cmd, timeout=3.0)
+        if not out.strip():
+            return []
+        data = json.loads(out)
+        if isinstance(data, dict):
+            data = [data]
+        results = []
+        for item in data:
+            ip = item.get("IPAddress")
+            prefix = item.get("PrefixLength")
+            alias = item.get("InterfaceAlias", "Unknown")
+            if ip and prefix and not ip.startswith("127.") and not ip.startswith("169.254."):
+                try:
+                    net = ipaddress.IPv4Network(f"{ip}/{prefix}", strict=False)
+                    if 8 <= net.prefixlen <= 30:
+                        results.append({
+                            "interface": alias,
+                            "ip": ip,
+                            "netmask": str(net.netmask),
+                            "cidr": str(net),
+                            "prefix_len": net.prefixlen,
+                            "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                        })
+                except Exception:
+                    pass
+        return results
+    except Exception:
+        return []
+
+
+def get_unix_subnets() -> List[Dict]:
+    """Detect network subnets on macOS / Linux via ifconfig or ip addr."""
+    results = []
+    try:
+        out = run_command(["ifconfig"], timeout=3.0)
+        if out:
+            current_iface = ""
+            for line in out.splitlines():
+                if line and not line[0].isspace() and ":" in line:
+                    current_iface = line.split(":")[0].strip()
+                m = re.search(
+                    r"inet\s+(\d+\.\d+\.\d+\.\d+)(?:\s+-->\s+\S+)?\s+netmask\s+(0x[0-9a-fA-F]+|\d+\.\d+\.\d+\.\d+)",
+                    line,
+                )
+                if m and current_iface:
+                    ip = m.group(1)
+                    if ip.startswith("127.") or ip.startswith("169.254."):
+                        continue
+                    mask_raw = m.group(2)
+                    if mask_raw.startswith("0x"):
+                        hex_val = int(mask_raw, 16)
+                        mask_str = socket.inet_ntoa(hex_val.to_bytes(4, "big"))
+                    else:
+                        mask_str = mask_raw
+                    try:
+                        net = ipaddress.IPv4Network(f"{ip}/{mask_str}", strict=False)
+                        if 8 <= net.prefixlen <= 30:
+                            results.append({
+                                "interface": current_iface,
+                                "ip": ip,
+                                "netmask": mask_str,
+                                "cidr": str(net),
+                                "prefix_len": net.prefixlen,
+                                "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                            })
+                        elif net.prefixlen == 32 and (
+                            current_iface.lower().startswith(("utun", "tun", "ppp", "wg"))
+                            or "POINTOPOINT" in line
+                        ):
+                            vpn_net = ipaddress.IPv4Network(f"{ip}/24", strict=False)
+                            results.append({
+                                "interface": f"{current_iface} (VPN)",
+                                "ip": ip,
+                                "netmask": "255.255.255.0",
+                                "cidr": str(vpn_net),
+                                "prefix_len": 24,
+                                "hosts_count": 254,
+                            })
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+
+    if not results:
+        try:
+            out = run_command(["ip", "-4", "-o", "addr", "show"], timeout=3.0)
+            for line in out.splitlines():
+                parts = line.split()
+                if len(parts) >= 4 and parts[2] == "inet":
+                    iface = parts[1]
+                    cidr = parts[3]
+                    try:
+                        net = ipaddress.IPv4Network(cidr, strict=False)
+                        ip_str = cidr.split("/")[0]
+                        if not ip_str.startswith("127.") and not ip_str.startswith("169.254."):
+                            if 8 <= net.prefixlen <= 30:
+                                results.append({
+                                    "interface": iface,
+                                    "ip": ip_str,
+                                    "netmask": str(net.netmask),
+                                    "cidr": str(net),
+                                    "prefix_len": net.prefixlen,
+                                    "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+                                })
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+    return results
+
+
+def detect_all_interface_subnets() -> List[Dict]:
+    """Detect all active IPv4 network interface subnets across Windows, macOS, and Linux."""
+    sys_name = platform.system()
+    subnets = []
+
+    if sys_name == "Windows":
+        subnets = get_windows_subnets_powershell()
+        if not subnets:
+            out = run_command(["ipconfig", "/all"], timeout=3.0)
+            if out:
+                subnets = parse_windows_ipconfig(out)
+    else:
+        subnets = get_unix_subnets()
+
+    seen_cidrs = set()
+    deduped = []
+    for item in subnets:
+        cidr = item["cidr"]
+        if cidr not in seen_cidrs:
+            seen_cidrs.add(cidr)
+            deduped.append(item)
+
+    if not deduped:
+        try:
+            local_ip = get_local_ip()
+            if local_ip and not local_ip.startswith("127."):
+                net = ipaddress.IPv4Network(f"{local_ip}/24", strict=False)
+                deduped.append({
+                    "interface": "Default",
+                    "ip": local_ip,
+                    "netmask": "255.255.255.0",
+                    "cidr": str(net),
+                    "prefix_len": 24,
+                    "hosts_count": 254,
+                })
+        except Exception:
+            pass
+
+    return deduped
+
+
+def get_available_subnets_info(custom_subnets: List[str] = None) -> Dict:
+    """Get rich metadata about detected and custom subnets."""
+    detected = detect_all_interface_subnets()
+    custom_list = []
+    for s in (custom_subnets or []):
+        if not s:
+            continue
+        try:
+            net = ipaddress.IPv4Network(str(s).strip(), strict=False)
+            custom_list.append({
+                "cidr": str(net),
+                "prefix_len": net.prefixlen,
+                "hosts_count": net.num_addresses - 2 if net.prefixlen <= 30 else 1,
+            })
+        except Exception:
+            pass
+
+    merged_networks = get_local_subnets(custom_subnets)
+    all_cidrs = [str(n) for n in merged_networks]
+    total_ips = sum(n.num_addresses - 2 if n.prefixlen <= 30 else 1 for n in merged_networks)
+
+    return {
+        "detected_subnets": detected,
+        "custom_subnets": custom_list,
+        "all_subnets": all_cidrs,
+        "total_subnets": len(all_cidrs),
+        "total_ips": total_ips,
     }
 
 
 def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Network]:
     """Detect local IPv4 network subnets automatically and merge custom/VPN subnets."""
-    subnets = []
-    # Try ifconfig on macOS / Linux
-    try:
-        out = subprocess.check_output(["ifconfig"], text=True, stderr=subprocess.DEVNULL)
-        for line in out.splitlines():
-            m = re.search(r"inet\s+(\d+\.\d+\.\d+\.\d+)\s+netmask\s+(0x[0-9a-fA-F]+)", line)
-            if m:
-                ip = m.group(1)
-                if ip.startswith("127."):
-                    continue
-                hex_val = int(m.group(2), 16)
-                mask_str = socket.inet_ntoa(hex_val.to_bytes(4, "big"))
-                net = ipaddress.IPv4Network(f"{ip}/{mask_str}", strict=False)
-                if 20 <= net.prefixlen <= 30 and net not in subnets:
-                    subnets.append(net)
-    except Exception:
-        pass
+    detected = detect_all_interface_subnets()
+    subnets: List[ipaddress.IPv4Network] = []
 
-    # Fallback to local machine IP with /24
+    for item in detected:
+        try:
+            net = ipaddress.IPv4Network(item["cidr"], strict=False)
+            if net not in subnets:
+                subnets.append(net)
+        except Exception:
+            pass
+
+    # Fallback to local machine IP with /24 if still empty
     if not subnets:
         try:
             local_ip = get_local_ip()
@@ -217,6 +645,7 @@ def get_local_subnets(custom_subnets: List[str] = None) -> List[ipaddress.IPv4Ne
     return subnets
 
 
+
 class PrinterManager:
     """
     Manages communication with Zebra printers.
@@ -234,20 +663,31 @@ class PrinterManager:
         saved_printers: List[Dict] = None,
         printer_aliases: Dict[str, str] = None,
         custom_subnets: List[str] = None,
+        verify_identity: bool = True,
+        strict_identity: bool = False,
+        cache_dir: Optional[Path] = None,
+        discovery_broadcast: bool = False,
     ):
         self.scan_network = scan_network
         self.network_timeout = network_timeout
         self.saved_printers = saved_printers or []
         self.printer_aliases = {k.lower(): v for k, v in (printer_aliases or {}).items()}
         self.custom_subnets = custom_subnets or ["192.168.0.0/22"]
+        self.verify_identity = verify_identity
+        self.strict_identity = strict_identity
+        self.discovery_broadcast = discovery_broadcast
 
         # Persistent printer cache directory and file
-        self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
+        if cache_dir is not None:
+            self.cache_dir = Path(cache_dir)
+        else:
+            self.cache_dir = Path.home() / ".config" / "zebra-print-bridge"
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.cache_file = self.cache_dir / "network_printers.json"
 
-        self._lock = threading.Lock()
-        self._network_printers: Dict[str, Dict] = {}  # ip -> printer info dict
+        self._lock = threading.RLock()
+        self._scan_lock = threading.Lock()
+        self._network_printers: Dict[str, Dict] = {}  # identity_key -> printer info dict (v2)
         self._alias_map: Dict[str, str] = {}          # lowercase alias -> ip
 
         # Load persisted cache immediately on startup
@@ -297,44 +737,196 @@ class PrinterManager:
         return True, None
 
     def _load_cache(self):
-        """Load persistent discovered printers from disk."""
-        if self.cache_file.exists():
-            try:
-                with open(self.cache_file, "r") as f:
-                    data = json.load(f)
-                printers = data.get("printers", {})
-                if isinstance(printers, list):
-                    printers = {p["ip"]: p for p in printers if "ip" in p}
-                with self._lock:
-                    self._network_printers = printers
-                    self._rebuild_alias_map_locked()
-                logger.info("Loaded %d persistent network printers from %s", len(printers), self.cache_file)
-            except Exception as e:
-                logger.warning("Failed to load network printers cache: %s", e)
+        """Load persistent discovered printers from disk with automatic v1 to v2 migration."""
+        if not self.cache_file.exists():
+            return
+
+        try:
+            with open(self.cache_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+
+            printers = {}
+            needs_save = False
+
+            if data.get("version") == 2 and isinstance(data.get("printers"), dict):
+                for k, p in data["printers"].items():
+                    mac = normalize_mac(p.get("mac") or p.get("mac_address"))
+                    serial = (p.get("serial") or p.get("unique_id") or "").strip() or None
+                    ip = p.get("ip")
+                    key = get_identity_key(mac, serial, ip) or k
+                    printers[key] = {
+                        "mac": mac,
+                        "serial": serial,
+                        "ip": ip,
+                        "port": int(p.get("port", self.DEFAULT_PORT)),
+                        "name": p.get("name", ""),
+                        "hostname": p.get("hostname", ""),
+                        "last_seen": p.get("last_seen") or datetime.now().isoformat(),
+                        "mac_source": p.get("mac_source"),
+                        "mac_address": mac or "",
+                        "unique_id": serial or "",
+                    }
+            else:
+                # Automatic migration from v1 (unversioned, keyed by IP or list)
+                raw_printers = data.get("printers", {})
+                if isinstance(raw_printers, list):
+                    items = raw_printers
+                elif isinstance(raw_printers, dict):
+                    items = list(raw_printers.values())
+                else:
+                    items = []
+
+                for p in items:
+                    mac = normalize_mac(p.get("mac_address") or p.get("mac"))
+                    serial = (p.get("unique_id") or p.get("serial") or "").strip() or None
+                    ip = p.get("ip")
+                    key = get_identity_key(mac, serial, ip)
+                    if not key:
+                        continue
+                    printers[key] = {
+                        "mac": mac,
+                        "serial": serial,
+                        "ip": ip,
+                        "port": int(p.get("port", self.DEFAULT_PORT)),
+                        "name": p.get("name", ""),
+                        "hostname": p.get("hostname", ""),
+                        "last_seen": p.get("last_seen") or datetime.now().isoformat(),
+                        "mac_source": "arp" if mac else None,
+                        "mac_address": mac or "",
+                        "unique_id": serial or "",
+                    }
+                needs_save = True
+                logger.info("Migrated %d printers from cache v1 to v2 identity format", len(printers))
+
+            with self._lock:
+                self._network_printers = printers
+                self._rebuild_alias_map_locked()
+
+            if needs_save and printers:
+                self._save_cache()
+
+            logger.info("Loaded %d persistent network printers from %s (v2)", len(printers), self.cache_file)
+        except Exception as e:
+            logger.warning("Failed to load network printers cache: %s", e)
 
     def _save_cache(self):
-        """Save discovered printers to disk persistently."""
+        """Save discovered printers to disk persistently in v2 format."""
         try:
             with self._lock:
                 data = {
+                    "version": 2,
                     "updated_at": datetime.now().isoformat(),
-                    "printers": dict(self._network_printers)
+                    "printers": dict(self._network_printers),
                 }
-            with open(self.cache_file, "w") as f:
+            with open(self.cache_file, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2)
-            logger.debug("Saved network printers cache to %s", self.cache_file)
+            logger.debug("Saved network printers cache (v2) to %s", self.cache_file)
         except Exception as e:
             logger.warning("Failed to save network printers cache: %s", e)
+
+    def _update_or_add_printer_locked(self, p: Dict) -> Tuple[bool, str]:
+        """
+        Add or update a printer entry in self._network_printers indexed by identity.
+        Returns (changed: bool, identity_key: str).
+        - Never creates duplicates for the same MAC or serial.
+        - If another device held the new IP, its IP is cleared.
+        """
+        mac = normalize_mac(p.get("mac") or p.get("mac_address"))
+        serial = (p.get("serial") or p.get("unique_id") or "").strip() or None
+        ip = p.get("ip")
+        port = int(p.get("port", self.DEFAULT_PORT))
+        name = (p.get("name") or "").strip()
+        hostname = (p.get("hostname") or "").strip()
+        last_seen = p.get("last_seen") or datetime.now().isoformat()
+        mac_source = p.get("mac_source")
+
+        # 1. Look for existing entry matching MAC, then serial, then IP-only key
+        matched_key = None
+        if mac and mac in self._network_printers:
+            matched_key = mac
+        elif serial:
+            for k, existing in self._network_printers.items():
+                if existing.get("serial") and existing["serial"] == serial:
+                    matched_key = k
+                    break
+        if not matched_key and ip:
+            ip_key = f"ip:{ip}"
+            if ip_key in self._network_printers:
+                matched_key = ip_key
+
+        # 2. Detect IP conflict: another entry currently has this IP
+        if ip:
+            stale_keys = []
+            for k, existing in list(self._network_printers.items()):
+                if k != matched_key and existing.get("ip") == ip:
+                    logger.warning(
+                        "IP %s was reassigned: moving from device '%s' to '%s'",
+                        ip, k, mac or (f"serial:{serial}" if serial else ip)
+                    )
+                    if k.startswith("ip:"):
+                        stale_keys.append(k)
+                    else:
+                        existing["ip"] = None
+            for k in stale_keys:
+                del self._network_printers[k]
+
+        # 3. Determine canonical identity key for this device
+        new_key = get_identity_key(mac, serial, ip)
+        if not new_key:
+            return False, ""
+
+        # 4. If matched under an older/weaker key (e.g. was serial:123 or ip:1.2.3.4, and now we have MAC)
+        existing_entry = self._network_printers.get(matched_key) if matched_key else None
+        if matched_key and matched_key != new_key:
+            del self._network_printers[matched_key]
+            if existing_entry:
+                if not name and existing_entry.get("name"):
+                    name = existing_entry["name"]
+                if not hostname and existing_entry.get("hostname"):
+                    hostname = existing_entry["hostname"]
+                if not serial and existing_entry.get("serial"):
+                    serial = existing_entry["serial"]
+
+        entry = {
+            "mac": mac or (existing_entry.get("mac") if existing_entry else None),
+            "serial": serial or (existing_entry.get("serial") if existing_entry else None),
+            "ip": ip,
+            "port": port,
+            "name": name or (existing_entry.get("name") if existing_entry else "") or (f"Zebra Printer ({ip})" if ip else "Zebra Printer"),
+            "hostname": hostname or (existing_entry.get("hostname") if existing_entry else ""),
+            "last_seen": last_seen,
+            "mac_source": mac_source or (existing_entry.get("mac_source") if existing_entry else None),
+            "mac_address": mac or (existing_entry.get("mac_address") if existing_entry else "") or "",
+            "unique_id": serial or (existing_entry.get("unique_id") if existing_entry else "") or "",
+        }
+
+        changed = True
+        if existing_entry:
+            if (existing_entry.get("ip") == entry["ip"] and
+                existing_entry.get("name") == entry["name"] and
+                existing_entry.get("serial") == entry["serial"] and
+                existing_entry.get("mac") == entry["mac"] and
+                matched_key == new_key):
+                changed = False
+
+        self._network_printers[new_key] = entry
+        return changed, new_key
 
     def _rebuild_alias_map_locked(self):
         """Rebuild fast alias lookup map from discovered printers and saved_printers."""
         mapping = {}
 
-        # 1. Discovered printers
-        for ip, p in self._network_printers.items():
-            name = p.get("name", "").strip()
-            host = p.get("hostname", "").strip()
-            uid = p.get("unique_id", "").strip()
+        # 1. Discovered printers (only entries with active IP)
+        for key, p in self._network_printers.items():
+            ip = p.get("ip")
+            if not ip:
+                continue
+
+            name = (p.get("name") or "").strip()
+            host = (p.get("hostname") or "").strip()
+            serial = (p.get("serial") or p.get("unique_id") or "").strip()
+            mac = (p.get("mac") or p.get("mac_address") or "").strip()
+
             if name:
                 name_lower = name.lower()
                 mapping[name_lower] = ip
@@ -346,21 +938,25 @@ class PrinterManager:
                     prefixed = f"nh-{name_lower}"
                     if prefixed not in mapping:
                         mapping[prefixed] = ip
+
             if host:
                 host_lower = host.lower()
                 mapping[host_lower] = ip
                 clean_host = host_lower.split(".")[0]
                 if clean_host not in mapping:
                     mapping[clean_host] = ip
-            if uid:
-                mapping[uid.lower()] = ip
-            mac = p.get("mac_address", "").strip()
+
+            if serial:
+                mapping[serial.lower()] = ip
+                mapping[f"serial:{serial.lower()}"] = ip
+
             if mac:
                 norm_mac = normalize_mac(mac)
                 if norm_mac:
-                    mapping[norm_mac.lower()] = ip
-                    mapping[norm_mac.lower().replace(":", "")] = ip
-                    mapping[norm_mac.lower().replace(":", "-")] = ip
+                    norm_lower = norm_mac.lower()
+                    mapping[norm_lower] = ip
+                    mapping[norm_lower.replace(":", "")] = ip
+                    mapping[norm_lower.replace(":", "-")] = ip
 
         # 2. User-defined saved_printers from config
         for p in self.saved_printers:
@@ -390,12 +986,14 @@ class PrinterManager:
     def refresh_known_printers(self, prune_unreachable: bool = True) -> bool:
         """
         Quickly poll all currently known printer IPs (<100ms) to detect renames,
-        updates, and optionally prune offline/unreachable printers.
+        updates, and detect if an IP moved to another device or is offline.
         Returns True if any changes occurred.
         """
         known_ips = set()
         with self._lock:
-            known_ips.update(self._network_printers.keys())
+            for p in self._network_printers.values():
+                if p.get("ip"):
+                    known_ips.add(p["ip"])
             for p in self.saved_printers:
                 if p.get("ip"):
                     known_ips.add(p["ip"])
@@ -413,9 +1011,8 @@ class PrinterManager:
                     res = fut.result()
                     if res:
                         with self._lock:
-                            existing = self._network_printers.get(ip)
-                            if not existing or existing.get("name") != res.get("name") or existing.get("unique_id") != res.get("unique_id"):
-                                self._network_printers[ip] = res
+                            entry_changed, _ = self._update_or_add_printer_locked(res)
+                            if entry_changed:
                                 changed = True
                     else:
                         unreachable_ips.add(ip)
@@ -425,9 +1022,16 @@ class PrinterManager:
         if prune_unreachable and unreachable_ips:
             with self._lock:
                 for ip in unreachable_ips:
-                    if ip in self._network_printers:
-                        del self._network_printers[ip]
-                        changed = True
+                    stale_keys = []
+                    for k, p in self._network_printers.items():
+                        if p.get("ip") == ip:
+                            if k.startswith("ip:"):
+                                stale_keys.append(k)
+                            else:
+                                p["ip"] = None
+                            changed = True
+                    for k in stale_keys:
+                        del self._network_printers[k]
 
         if changed:
             with self._lock:
@@ -439,16 +1043,28 @@ class PrinterManager:
                     self.cache_file.unlink()
                 except Exception:
                     pass
-            logger.info("Updated printer aliases from network: %s", {p["name"]: p["ip"] for p in self._network_printers.values()})
+            logger.info("Updated printer aliases from network: %s", {p.get("name", "Zebra"): p.get("ip") for p in self._network_printers.values() if p.get("ip")})
 
         return changed
 
-    def scan_subnet(self, clear_cache: bool = False) -> Dict[str, Dict]:
-        """Scan all local subnets for port 9100 Zebra printers concurrently."""
+    def get_subnets_info(self) -> Dict:
+        """Return full information about detected and custom subnets."""
+        return get_available_subnets_info(self.custom_subnets)
+
+    def scan_subnet(self, clear_cache: bool = False, specific_subnet: Optional[str] = None) -> Dict[str, Dict]:
+        """Scan all local subnets (or a specific subnet) for port 9100 Zebra printers concurrently."""
         if clear_cache:
             self.clear_cache()
 
-        subnets = get_local_subnets(self.custom_subnets)
+        if specific_subnet:
+            try:
+                subnets = [ipaddress.IPv4Network(str(specific_subnet).strip(), strict=False)]
+            except Exception as e:
+                logger.error("Invalid subnet '%s': %s", specific_subnet, e)
+                return {}
+        else:
+            subnets = get_local_subnets(self.custom_subnets)
+
         if not subnets:
             return {}
 
@@ -472,14 +1088,14 @@ class PrinterManager:
 
         with self._lock:
             if clear_cache:
-                self._network_printers = discovered
-            else:
-                self._network_printers.update(discovered)
+                self._network_printers.clear()
+            for p in discovered.values():
+                self._update_or_add_printer_locked(p)
             self._rebuild_alias_map_locked()
 
         if self._network_printers:
             self._save_cache()
-            logger.info("Discovered %d Zebra printers on network: %s", len(discovered), [p["name"] for p in discovered.values()])
+            logger.info("Discovered %d Zebra printers on network: %s", len(discovered), [p.get("name") for p in discovered.values()])
         elif clear_cache and self.cache_file.exists():
             try:
                 self.cache_file.unlink()
@@ -528,99 +1144,527 @@ class PrinterManager:
             except Exception as e:
                 logger.debug("Background scanner iteration error: %s", e)
 
+    @staticmethod
+    def _check_port_open(ip: str, port: int, timeout: float = 0.5) -> bool:
+        """Passive TCP check on port 9100. NEVER sends any bytes."""
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            res = s.connect_ex((ip, port))
+            s.close()
+            return res == 0
+        except Exception:
+            return False
+
+    def discover_broadcast(self, timeout: float = 2.0) -> List[Dict]:
+        """
+        Discover Zebra printers via UDP 4201 broadcast.
+
+        TODO (M8): Zebra Link-OS printers support discovery via directed or subnet broadcast
+        on UDP port 4201 (used by Zebra Setup Utilities and Link-OS SDK NetworkDiscoverer).
+        However, the exact wire format for the discovery request and response payload
+        (e.g., DiscoveryPacket / DiscoveryPacketDecoder framing and magic bytes) requires
+        reverse-engineering the proprietary binary structure or referencing official Zebra SDK
+        documentation that is not publicly open without proprietary licensing.
+        Until confirmed with official specification, this feature remains a non-blocking stub
+        guarded behind discovery_broadcast=False to ensure reliability and zero unwanted traffic.
+        """
+        if not self.discovery_broadcast:
+            return []
+        logger.debug("discover_broadcast called but UDP 4201 protocol specification is pending.")
+        return []
+
+    def verify_device_identity(
+        self,
+        ip: str,
+        expected_mac: Optional[str] = None,
+        expected_serial: Optional[str] = None,
+        timeout: float = 0.3,
+    ) -> Tuple[str, Optional[str], Optional[str]]:
+        """
+        Verify that the device responding at `ip` matches expected MAC and/or serial.
+        Returns (verification: str, detected_mac: Optional[str], detected_serial: Optional[str]).
+        - "match": expected MAC and/or serial matches detected device identity.
+        - "mismatch": detected MAC and/or serial contradicts expected identity.
+        - "unverifiable": device does not answer SNMP/ARP or no identity could be confirmed.
+        """
+        detected_mac = None
+        detected_serial = None
+
+        # 1. Check SNMP MAC via UDP 161 (passive)
+        snmp_mac = _query_snmp_mac(ip, timeout=timeout)
+        if snmp_mac:
+            detected_mac = snmp_mac
+
+        # 2. Check SNMP serial via UDP 161 (passive)
+        snmp_serial = _query_snmp_string(ip, [1, 3, 6, 1, 4, 1, 10642, 1, 9, 0], timeout=timeout)
+        if snmp_serial:
+            detected_serial = snmp_serial
+
+        # 3. If no SNMP MAC, check ARP table (local subnet fallback)
+        if not detected_mac:
+            arp_mac = get_mac_for_ip(ip)
+            if arp_mac:
+                detected_mac = arp_mac
+
+        # Validate against expected serial if provided
+        if expected_serial and detected_serial:
+            if expected_serial.strip().lower() != detected_serial.strip().lower():
+                logger.warning(
+                    "Identity verification failed at %s: expected serial '%s', detected '%s'",
+                    ip, expected_serial, detected_serial
+                )
+                return "mismatch", detected_mac, detected_serial
+
+        # Validate against expected MAC if provided
+        if expected_mac and detected_mac:
+            norm_exp = normalize_mac(expected_mac)
+            norm_det = normalize_mac(detected_mac)
+            if norm_exp and norm_det and norm_det != norm_exp:
+                logger.warning(
+                    "Identity verification failed at %s: expected MAC '%s', detected '%s'",
+                    ip, norm_exp, norm_det
+                )
+                return "mismatch", detected_mac, detected_serial
+
+        # Check if matched
+        matched_mac = bool(expected_mac and detected_mac and normalize_mac(expected_mac) == normalize_mac(detected_mac))
+        matched_serial = bool(expected_serial and detected_serial and expected_serial.strip().lower() == detected_serial.strip().lower())
+
+        if matched_mac or matched_serial:
+            return "match", detected_mac, detected_serial
+
+        # No contradiction, but identity could not be verified
+        return "unverifiable", detected_mac, detected_serial
+
+    def resolve_target(
+        self,
+        mac: Optional[str] = None,
+        ip: Optional[str] = None,
+        host: Optional[str] = None,
+        printer_name: Optional[str] = None,
+    ) -> ResolvedTarget:
+        """
+        Unified single-pass target resolution.
+        Priority:
+        1. Simulated 'test' destination
+        2. Primary Network: MAC address (with optional hint IP verification)
+        3. Secondary Network: IP address, hostname, or network alias
+        4. Local OS Printer: printer_name
+        5. Fallback: OS default printer
+        Prohibited: Attempting DNS on MAC strings.
+        Serialized: At most one scan_subnet execution across concurrent calls.
+        """
+        # 1. Simulated test target check
+        target_check = (ip or host or printer_name or "").strip().lower()
+        if target_check == "test":
+            return ResolvedTarget(
+                ip="test",
+                port=self.DEFAULT_PORT,
+                source="test",
+                reachable=True,
+                message="Test printer ready (simulated)",
+            )
+
+        # 2. Primary Network: MAC address
+        target_mac = mac
+        hint_ip = None
+        hint_port = self.DEFAULT_PORT
+        raw_ip = ip or host
+
+        if not target_mac and raw_ip and is_valid_mac(raw_ip):
+            target_mac = raw_ip
+            raw_ip = None
+        elif target_mac and raw_ip:
+            parsed_addr, parsed_port = parse_target_address_port(raw_ip, self.DEFAULT_PORT)
+            if is_valid_ipv4(parsed_addr):
+                hint_ip = parsed_addr
+                hint_port = parsed_port
+
+        if target_mac:
+            norm_mac = normalize_mac(target_mac)
+            if not norm_mac:
+                return ResolvedTarget(message=f"Invalid MAC address: '{target_mac}'")
+
+            # M5: If printer_ip was passed alongside printer_mac, use as hint
+            if hint_ip:
+                if self._check_port_open(hint_ip, hint_port, timeout=min(self.network_timeout, 1.0)):
+                    verification = "unverifiable"
+                    det_mac = None
+                    det_serial = None
+                    if self.verify_identity:
+                        verification, det_mac, det_serial = self.verify_device_identity(hint_ip, expected_mac=norm_mac)
+                    if verification == "match":
+                        logger.info("Hint IP '%s' verified for MAC '%s'", hint_ip, norm_mac)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": hint_ip,
+                                "port": hint_port,
+                                "mac_source": "snmp" if det_mac == norm_mac else "hint",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=hint_ip,
+                            port=hint_port,
+                            source="hint",
+                            reachable=True,
+                            verified=True,
+                            verification="match",
+                            message=f"Resolved via verified hint IP {hint_ip}",
+                        )
+                    elif verification == "unverifiable":
+                        _log_unverifiable_once(hint_ip)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": hint_ip,
+                                "port": hint_port,
+                                "mac_source": "hint",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=hint_ip,
+                            port=hint_port,
+                            source="hint",
+                            reachable=True,
+                            verified=False,
+                            verification="unverifiable",
+                            message=f"Resolved via hint IP {hint_ip} (identity unverifiable)",
+                        )
+                    else:
+                        logger.warning(
+                            "Hint IP '%s' reachable on port %d but identity mismatch (expected %s, got %s). Proceeding with MAC resolution.",
+                            hint_ip, hint_port, norm_mac, det_mac or "unknown"
+                        )
+                else:
+                    logger.debug("Hint IP '%s' unreachable on port %d. Proceeding with MAC resolution.", hint_ip, hint_port)
+
+            # Check cache
+            cached_ip = None
+            cached_serial = None
+            cached_port = self.DEFAULT_PORT
+            with self._lock:
+                entry = self._network_printers.get(norm_mac)
+                if entry and entry.get("ip"):
+                    cached_ip = entry["ip"]
+                    cached_serial = entry.get("serial")
+                    cached_port = int(entry.get("port", self.DEFAULT_PORT))
+
+            if cached_ip and is_valid_ipv4(cached_ip):
+                if self._check_port_open(cached_ip, cached_port, timeout=min(self.network_timeout, 1.0)):
+                    if self.verify_identity:
+                        verification, det_mac, det_serial = self.verify_device_identity(
+                            cached_ip,
+                            expected_mac=norm_mac,
+                            expected_serial=cached_serial,
+                        )
+                        if verification == "match":
+                            return ResolvedTarget(
+                                mac=norm_mac,
+                                serial=det_serial or cached_serial,
+                                ip=cached_ip,
+                                port=cached_port,
+                                source="cache",
+                                reachable=True,
+                                verified=True,
+                                verification="match",
+                                message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip}",
+                            )
+                        elif verification == "unverifiable":
+                            _log_unverifiable_once(cached_ip)
+                            return ResolvedTarget(
+                                mac=norm_mac,
+                                serial=det_serial or cached_serial,
+                                ip=cached_ip,
+                                port=cached_port,
+                                source="cache",
+                                reachable=True,
+                                verified=False,
+                                verification="unverifiable",
+                                message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip} (identity unverifiable)",
+                            )
+                        else:
+                            logger.warning(
+                                "Cached IP '%s' for MAC '%s' failed identity verification. Invalidating cached IP.",
+                                cached_ip, norm_mac
+                            )
+                            with self._lock:
+                                if norm_mac in self._network_printers:
+                                    self._network_printers[norm_mac]["ip"] = None
+                                    self._rebuild_alias_map_locked()
+                                    self._save_cache()
+                    else:
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=cached_serial,
+                            ip=cached_ip,
+                            port=cached_port,
+                            source="cache",
+                            reachable=True,
+                            verified=False,
+                            verification="unverifiable",
+                            message=f"Resolved MAC '{norm_mac}' from cache -> {cached_ip}",
+                        )
+                else:
+                    logger.info("Cached IP '%s' for MAC '%s' port %d unreachable. Invalidating cached IP.", cached_ip, norm_mac, cached_port)
+                    with self._lock:
+                        if norm_mac in self._network_printers:
+                            self._network_printers[norm_mac]["ip"] = None
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+
+            # Check OS ARP table
+            arp_ip = get_ip_for_mac(norm_mac)
+            if arp_ip and is_valid_ipv4(arp_ip):
+                if self._check_port_open(arp_ip, self.DEFAULT_PORT, timeout=min(self.network_timeout, 1.0)):
+                    verification = "unverifiable"
+                    det_mac = None
+                    det_serial = None
+                    if self.verify_identity:
+                        verification, det_mac, det_serial = self.verify_device_identity(arp_ip, expected_mac=norm_mac)
+                    if verification == "match":
+                        logger.info("Resolved MAC '%s' from OS ARP table -> %s", norm_mac, arp_ip)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": arp_ip,
+                                "port": self.DEFAULT_PORT,
+                                "mac_source": "arp",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=arp_ip,
+                            port=self.DEFAULT_PORT,
+                            source="arp",
+                            reachable=True,
+                            verified=True,
+                            verification="match",
+                            message=f"Resolved MAC '{norm_mac}' from ARP table -> {arp_ip}",
+                        )
+                    elif verification == "unverifiable":
+                        _log_unverifiable_once(arp_ip)
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "serial": det_serial,
+                                "ip": arp_ip,
+                                "port": self.DEFAULT_PORT,
+                                "mac_source": "arp",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=det_serial,
+                            ip=arp_ip,
+                            port=self.DEFAULT_PORT,
+                            source="arp",
+                            reachable=True,
+                            verified=False,
+                            verification="unverifiable",
+                            message=f"Resolved MAC '{norm_mac}' from ARP table -> {arp_ip} (identity unverifiable)",
+                        )
+
+            # Subnet scan (serialized with _scan_lock, max once per request)
+            if self.scan_network:
+                logger.info("MAC '%s' not in cache or ARP. Scanning network (serialized)...", norm_mac)
+                with self._scan_lock:
+                    # Check cache again inside lock in case another scan just finished
+                    with self._lock:
+                        entry = self._network_printers.get(norm_mac)
+                        scan_ip = entry.get("ip") if entry else None
+                        scan_serial = entry.get("serial") if entry else None
+                        scan_port = int(entry.get("port", self.DEFAULT_PORT)) if entry else self.DEFAULT_PORT
+
+                    if scan_ip and is_valid_ipv4(scan_ip):
+                        if self._check_port_open(scan_ip, scan_port, timeout=min(self.network_timeout, 1.0)):
+                            return ResolvedTarget(
+                                mac=norm_mac,
+                                serial=scan_serial,
+                                ip=scan_ip,
+                                port=scan_port,
+                                source="cache",
+                                reachable=True,
+                                verified=True,
+                                message=f"Resolved MAC '{norm_mac}' from cache -> {scan_ip}",
+                            )
+
+                    self.scan_subnet()
+
+                    with self._lock:
+                        entry = self._network_printers.get(norm_mac)
+                        post_scan_ip = entry.get("ip") if entry else None
+                        post_scan_serial = entry.get("serial") if entry else None
+                        post_scan_port = int(entry.get("port", self.DEFAULT_PORT)) if entry else self.DEFAULT_PORT
+
+                    if post_scan_ip and is_valid_ipv4(post_scan_ip):
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            serial=post_scan_serial,
+                            ip=post_scan_ip,
+                            port=post_scan_port,
+                            source="discovery",
+                            reachable=True,
+                            verified=True,
+                            message=f"Resolved MAC '{norm_mac}' after subnet scan -> {post_scan_ip}",
+                        )
+
+                    arp_ip = get_ip_for_mac(norm_mac)
+                    if arp_ip and is_valid_ipv4(arp_ip):
+                        with self._lock:
+                            self._update_or_add_printer_locked({
+                                "mac": norm_mac,
+                                "ip": arp_ip,
+                                "mac_source": "arp",
+                            })
+                            self._rebuild_alias_map_locked()
+                            self._save_cache()
+                        return ResolvedTarget(
+                            mac=norm_mac,
+                            ip=arp_ip,
+                            port=self.DEFAULT_PORT,
+                            source="arp",
+                            reachable=True,
+                            verified=False,
+                            message=f"Resolved MAC '{norm_mac}' from ARP table after scan -> {arp_ip}",
+                        )
+
+            # PROHIBITED: NEVER call getaddrinfo or append .local to MAC!
+            return ResolvedTarget(
+                mac=norm_mac,
+                reachable=False,
+                resolved=False,
+                message=f"Printer with MAC {norm_mac} not found on network",
+            )
+
+        # 3. Secondary Network: IP address, hostname, or network alias
+        net_target = (raw_ip or "").strip()
+        if net_target:
+            addr, port = parse_target_address_port(net_target, self.DEFAULT_PORT)
+            if is_valid_ipv4(addr):
+                return ResolvedTarget(ip=addr, port=port, source="manual")
+
+            addr_lower = addr.lower()
+            with self._lock:
+                if addr_lower in self._alias_map:
+                    return ResolvedTarget(ip=self._alias_map[addr_lower], port=port, source="alias")
+
+            # DNS resolution
+            try:
+                ai = socket.getaddrinfo(addr, None)
+                resolved_ip = ai[0][4][0] if ai and len(ai[0]) > 4 and ai[0][4] else addr
+                return ResolvedTarget(host=addr, ip=resolved_ip, port=port, source="dns", resolved=True)
+            except socket.gaierror:
+                pass
+
+            # mDNS suffixes
+            if not addr.endswith(".local") and not addr.endswith(".localdomain"):
+                for suffix in (".local", ".localdomain"):
+                    cand = f"{addr}{suffix}"
+                    try:
+                        ai = socket.getaddrinfo(cand, None)
+                        resolved_ip = ai[0][4][0] if ai and len(ai[0]) > 4 and ai[0][4] else cand
+                        return ResolvedTarget(host=addr, ip=resolved_ip, port=port, source="mdns", resolved=True)
+                    except socket.gaierror:
+                        pass
+
+            # Subnet scan fallback (serialized)
+            if self.scan_network:
+                with self._scan_lock:
+                    with self._lock:
+                        if addr_lower in self._alias_map:
+                            return ResolvedTarget(host=addr, ip=self._alias_map[addr_lower], port=port, source="alias", resolved=True)
+                    self.scan_subnet()
+                    with self._lock:
+                        if addr_lower in self._alias_map:
+                            return ResolvedTarget(host=addr, ip=self._alias_map[addr_lower], port=port, source="discovery", resolved=True)
+
+            return ResolvedTarget(
+                host=addr,
+                port=port,
+                resolved=False,
+                ip=None,
+                reachable=False,
+                message=f"Cannot resolve network address '{addr}'",
+            )
+
+        # 4. Local OS Printer: printer_name
+        if printer_name:
+            clean_name = printer_name.strip()
+            local = self.find_local_printer(clean_name)
+            if local:
+                return ResolvedTarget(
+                    printer_name=local["name"],
+                    use_local=True,
+                    source="local",
+                    reachable=True,
+                    message=f"Local printer '{local['name']}' found",
+                )
+            # Check if printer_name is actually a network alias
+            clean_lower = clean_name.lower()
+            with self._lock:
+                if clean_lower in self._alias_map:
+                    return ResolvedTarget(ip=self._alias_map[clean_lower], port=self.DEFAULT_PORT, source="alias")
+
+            # Fallback to default local printer
+            default_local = self.get_default_local_printer()
+            if default_local:
+                return ResolvedTarget(
+                    printer_name=default_local["name"],
+                    use_local=True,
+                    source="default_local",
+                    reachable=True,
+                    message=f"Printer '{clean_name}' not found; fell back to default OS printer '{default_local['name']}'",
+                )
+            return ResolvedTarget(printer_name=clean_name, resolved=False, message=f"Printer '{clean_name}' not found in OS or network")
+
+        # 5. Fallback: OS default printer
+        default_local = self.get_default_local_printer()
+        if default_local:
+            return ResolvedTarget(
+                printer_name=default_local["name"],
+                use_local=True,
+                source="default_local",
+                reachable=True,
+                message=f"Using default OS printer '{default_local['name']}'",
+            )
+
+        return ResolvedTarget(resolved=False, message="No printer target specified")
+
     def resolve_network_address(self, address: str) -> str:
         """
-        Resolve a network printer name/hostname to IP address.
-        Zero hardcoding: checks persistent dynamic cache, standard DNS, fast poll, and subnet scan.
-        All network probes are 100% passive and NEVER send bytes to port 9100.
+        Backward-compatible wrapper around resolve_target.
         """
         if not address:
             return address
 
         clean_addr = address.strip()
-        if is_valid_ipv4(clean_addr):
-            return clean_addr
-
-        # Special handling for MAC address targeting (e.g. '00:07:4D:6F:C2:14' or '00074d6fc214')
         if is_valid_mac(clean_addr):
-            norm_mac = normalize_mac(clean_addr)
-            if norm_mac:
-                # 1. Check in-memory alias map
-                with self._lock:
-                    if norm_mac.lower() in self._alias_map:
-                        resolved = self._alias_map[norm_mac.lower()]
-                        logger.info("Resolved printer MAC '%s' -> %s (dynamic cache)", norm_mac, resolved)
-                        return resolved
+            res = self.resolve_target(mac=clean_addr)
+            return res.ip or clean_addr
 
-                # 2. Check OS ARP table directly (instant, safe)
-                arp_ip = get_ip_for_mac(norm_mac)
-                if arp_ip:
-                    logger.info("Resolved printer MAC '%s' -> %s (OS ARP table)", norm_mac, arp_ip)
-                    return arp_ip
-
-                # 3. Refresh known printers if scan_network is enabled
-                if self.scan_network:
-                    self.refresh_known_printers()
-                    arp_ip = get_ip_for_mac(norm_mac)
-                    if arp_ip:
-                        return arp_ip
-                    with self._lock:
-                        if norm_mac.lower() in self._alias_map:
-                            return self._alias_map[norm_mac.lower()]
-
-        clean_lower = clean_addr.lower()
-
-        # 1. In-memory lookup from discovered & saved printers / aliases
-        with self._lock:
-            if clean_lower in self._alias_map:
-                resolved = self._alias_map[clean_lower]
-                logger.info("Resolved printer alias '%s' -> %s (dynamic cache)", clean_addr, resolved)
-                return resolved
-
-        # 2. Standard DNS resolution
-        try:
-            socket.getaddrinfo(clean_addr, None)
-            return clean_addr
-        except socket.gaierror:
-            pass
-
-        # 3. Try mDNS suffixes (.local, .localdomain)
-        if not clean_addr.endswith(".local") and not clean_addr.endswith(".localdomain"):
-            for suffix in (".local", ".localdomain"):
-                candidate = f"{clean_addr}{suffix}"
-                try:
-                    socket.getaddrinfo(candidate, None)
-                    logger.info("Resolved printer hostname '%s' -> '%s' via DNS search", clean_addr, candidate)
-                    return candidate
-                except socket.gaierror:
-                    pass
-
-        # 4. If still not found and scan_network is enabled, check network printers safely
-        if self.scan_network:
-            logger.info("Printer alias '%s' not in cache. Refreshing known network printers...", clean_addr)
-            self.refresh_known_printers()
-            with self._lock:
-                if clean_lower in self._alias_map:
-                    resolved = self._alias_map[clean_lower]
-                    logger.info("Resolved printer alias '%s' -> %s after fast poll", clean_addr, resolved)
-                    return resolved
-
-            logger.info("Printer alias '%s' still unknown. Scanning local subnet (passive)...", clean_addr)
-            self.scan_subnet()
-            with self._lock:
-                if clean_lower in self._alias_map:
-                    resolved = self._alias_map[clean_lower]
-                    logger.info("Resolved printer alias '%s' -> %s after subnet scan", clean_addr, resolved)
-                    return resolved
-
-        # Return original address (let socket connection report specific connectivity or gaierror)
-        return clean_addr
+        res = self.resolve_target(ip=clean_addr)
+        return res.ip or clean_addr
 
     def _send_network(self, printer: Dict, zpl: str) -> Tuple[bool, Optional[str]]:
         """Send ZPL to a network printer via TCP socket."""
         address = printer.get('address')
         port = printer.get('port', self.DEFAULT_PORT)
-        resolved_address = self.resolve_network_address(address) if address else address
+        # address is already resolved by resolve_target
+        resolved_address = address
         logger.info(
             "send_network target=%s (resolved=%s):%s raw_bytes=%s",
             address,
@@ -669,12 +1713,18 @@ class PrinterManager:
             return False, "No printer name"
 
         try:
+            kwargs = {
+                "input": raw.encode("utf-8"),
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.PIPE,
+                "timeout": 15,
+            }
+            if platform.system() == "Windows":
+                kwargs["creationflags"] = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
             proc = subprocess.run(
                 ["lp", "-d", printer_name, "-o", "raw"],
-                input=raw.encode("utf-8"),
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                timeout=15,
+                **kwargs
             )
             if proc.returncode == 0:
                 logger.info("Raw payload successfully sent to CUPS printer: '%s'.", printer_name)
@@ -719,12 +1769,19 @@ class PrinterManager:
 
     # ── Connection testing ───────────────────────────────────────────
 
-    def _test_network_connection(self, address: str, port: int) -> Tuple[bool, str]:
-        """Test TCP connection to a network printer by IP or hostname with descriptive error reporting."""
+    def _test_network_connection(
+        self,
+        address: str,
+        port: int,
+        expected_mac: Optional[str] = None,
+        expected_serial: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """Test TCP connection to a network printer by IP or hostname with identity verification."""
         if not address:
             return False, "No printer address"
 
-        resolved_address = self.resolve_network_address(address)
+        resolved_address = address
+
         timeout = max(self.network_timeout, 1.5)
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -733,6 +1790,24 @@ class PrinterManager:
                 result = sock.connect_ex((resolved_address, port))
                 display = f"{address} ({resolved_address}:{port})" if resolved_address != address else f"{address}:{port}"
                 if result == 0:
+                    # M4: Verify device identity if requested
+                    if self.verify_identity and (expected_mac or expected_serial):
+                        verification, det_mac, det_serial = self.verify_device_identity(
+                            resolved_address,
+                            expected_mac=expected_mac,
+                            expected_serial=expected_serial,
+                        )
+                        if verification == "mismatch":
+                            with self._lock:
+                                if expected_mac and expected_mac in self._network_printers:
+                                    self._network_printers[expected_mac]["ip"] = None
+                                    self._rebuild_alias_map_locked()
+                            det_id = det_mac or det_serial or "unknown"
+                            exp_id = expected_mac or expected_serial
+                            return False, f"Identity verification failed: device at {resolved_address} ({det_id}) does not match expected {exp_id}"
+                        elif verification == "unverifiable":
+                            _log_unverifiable_once(resolved_address)
+
                     return True, f"Connected to {display}"
                 return False, f"Cannot connect to printer at {display}"
             finally:
@@ -745,7 +1820,7 @@ class PrinterManager:
             return False, f"Error connecting to {address}:{port}: {e}"
 
     def test_connection(self, printer: Dict) -> Tuple[bool, str]:
-        """Test connection to a printer."""
+        """Test connection to a printer with optional identity verification."""
         logger.info(
             "test_connection printer_type=%s target=%s",
             printer.get('type'),
@@ -757,7 +1832,14 @@ class PrinterManager:
         elif printer.get('type') == 'network':
             address = printer.get('address')
             port = printer.get('port', self.DEFAULT_PORT)
-            return self._test_network_connection(address, port)
+            expected_mac = printer.get('mac') or printer.get('mac_address')
+            expected_serial = printer.get('serial') or printer.get('unique_id')
+            return self._test_network_connection(
+                address,
+                port,
+                expected_mac=expected_mac,
+                expected_serial=expected_serial,
+            )
 
         return False, "Unknown printer type"
 
@@ -785,16 +1867,23 @@ class PrinterManager:
         with self._lock:
             printers = []
             for p in self._network_printers.values():
+                ip = p.get("ip")
+                mac = p.get("mac") or p.get("mac_address", "")
+                serial = p.get("serial") or p.get("unique_id", "")
                 printers.append({
                     "name": p.get("name", "Zebra Network Printer"),
                     "type": "network",
                     "hostname": p.get("hostname", ""),
-                    "address": p.get("ip"),
-                    "ip": p.get("ip"),
+                    "address": ip,
+                    "ip": ip,
                     "port": p.get("port", self.DEFAULT_PORT),
-                    "status": "ready",
-                    "unique_id": p.get("unique_id", ""),
-                    "mac_address": p.get("mac_address", ""),
+                    "status": "ready" if ip else "offline",
+                    "unique_id": serial,
+                    "serial": serial,
+                    "mac_address": mac,
+                    "mac": mac,
+                    "mac_source": p.get("mac_source"),
+                    "last_seen": p.get("last_seen"),
                 })
             # Sort by name
             printers.sort(key=lambda x: x["name"])
@@ -813,15 +1902,9 @@ class PrinterManager:
                 logger.debug("Failed to get Windows default printer name: %s", e)
         elif platform.system() in ("Darwin", "Linux"):
             try:
-                proc = subprocess.run(
-                    ["lpstat", "-d"],
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    timeout=5,
-                )
-                if proc.returncode == 0:
-                    match = re.search(r"system default destination:\s*(.+)", proc.stdout)
+                out = run_command(["lpstat", "-d"])
+                if out:
+                    match = re.search(r"system default destination:\s*(.+)", out)
                     if match:
                         return match.group(1).strip()
             except Exception as e:
@@ -880,15 +1963,9 @@ class PrinterManager:
         printers_map = {}
         try:
             # Parse printer statuses from lpstat -p
-            p_proc = subprocess.run(
-                ["lpstat", "-p"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            if p_proc.returncode == 0:
-                for line in p_proc.stdout.splitlines():
+            p_out = run_command(["lpstat", "-p"])
+            if p_out:
+                for line in p_out.splitlines():
                     m = re.match(r"^printer\s+(\S+)\s+(.+)", line.strip())
                     if m:
                         name = m.group(1)
@@ -913,15 +1990,9 @@ class PrinterManager:
                         }
 
             # Supplement with available printer destinations from lpstat -e
-            e_proc = subprocess.run(
-                ["lpstat", "-e"],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=5,
-            )
-            if e_proc.returncode == 0:
-                for dest in e_proc.stdout.splitlines():
+            e_out = run_command(["lpstat", "-e"])
+            if e_out:
+                for dest in e_out.splitlines():
                     dest = dest.strip()
                     if dest and dest not in printers_map:
                         printers_map[dest] = {
@@ -1002,4 +2073,485 @@ class PrinterManager:
 
         return None
 
+    def get_printer_config(self, target: str) -> Dict:
+        """Get live configuration from a network Zebra printer."""
+        resolved = self.resolve_target(ip=target, host=target, printer_name=target)
+        if not resolved.resolved or not resolved.ip:
+            raise ValueError(resolved.message or f"Printer '{target}' not found or unreachable")
 
+        if resolved.use_local:
+            local = self.find_local_printer(resolved.printer_name or target)
+            return {
+                "success": True,
+                "target": target,
+                "printer_type": "local",
+                "name": resolved.printer_name,
+                "message": "Local OS spooler printer (hardware SGD queries only supported via network TCP/IP port 9100)",
+                "local_info": local or {},
+            }
+
+        res = get_printer_sgd_config(resolved.ip, resolved.port)
+        return {
+            "success": True,
+            "target": target,
+            "resolved_ip": resolved.ip,
+            "port": resolved.port,
+            "printer_type": "network",
+            **res,
+            "schema": PRINTER_CONFIG_SCHEMA["options"],
+        }
+
+    def set_printer_config(self, target: str, settings: Dict) -> Dict:
+        """Apply live configuration to a network Zebra printer via SGD without printing."""
+        resolved = self.resolve_target(ip=target, host=target, printer_name=target)
+        if not resolved.resolved or not resolved.ip:
+            raise ValueError(resolved.message or f"Printer '{target}' not found or unreachable")
+
+        if resolved.use_local:
+            raise ValueError(
+                f"Direct configuration via SGD is only supported for network Zebra printers, but '{target}' is a local OS printer."
+            )
+
+        success, applied, err = set_printer_sgd_config(resolved.ip, resolved.port, settings)
+        if not success:
+            raise RuntimeError(err or "Failed to apply printer configuration")
+
+        updated = get_printer_sgd_config(resolved.ip, resolved.port)
+        return {
+            "success": True,
+            "message": f"Configuration applied successfully to '{target}' ({resolved.ip}:{resolved.port})",
+            "target": target,
+            "resolved_ip": resolved.ip,
+            "port": resolved.port,
+            "applied_settings": applied,
+            "current_config": updated.get("config", {}),
+        }
+
+    def get_printer_config_schema(self) -> Dict:
+        """Return the complete schema of configurable options."""
+        return PRINTER_CONFIG_SCHEMA
+
+
+def connect_smart_socket(ip: str, port: int = 9100, timeout: float = 3.0) -> Optional[socket.socket]:
+    """Connect to a printer IP, binding to local interface if direct routing fails (e.g. multi-homed / VPN)."""
+    # 1. Try standard connection
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect((ip, port))
+        return s
+    except Exception:
+        s.close()
+
+    # 2. Try binding to detected interfaces
+    try:
+        subnets = detect_all_interface_subnets()
+        for iface in subnets:
+            if_ip = iface.get("ip")
+            if not if_ip or if_ip.startswith("127."):
+                continue
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(timeout)
+            try:
+                s.bind((if_ip, 0))
+                s.connect((ip, port))
+                return s
+            except Exception:
+                s.close()
+    except Exception:
+        pass
+
+    return None
+
+
+PRINTER_CONFIG_SCHEMA = {
+    "options": {
+        "print_method": {
+            "type": "string",
+            "choices": ["direct thermal", "thermal transfer"],
+            "description": "Printing method: direct thermal (heat-sensitive paper, ribbonless) or thermal transfer (uses ribbon)",
+            "sgd_var": "ezpl.print_method",
+        },
+        "media_type": {
+            "type": "string",
+            "choices": ["gap/notch", "continuous", "mark"],
+            "description": "Media sensor type: gap/notch (die-cut labels with gap), continuous (receipt paper), mark (black mark on backing)",
+            "sgd_var": "ezpl.media_type",
+        },
+        "print_mode": {
+            "type": "string",
+            "choices": ["tear off", "peel off", "rewind", "cutter"],
+            "description": "Action after printing: tear off, peel off, rewind, or cutter",
+            "sgd_var": "ezpl.print_mode",
+        },
+        "print_width": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Printhead printable width in dots (e.g. 609 for 3.0\" at 203 dpi, 832 for 4.09\" at 203 dpi)",
+            "min": 2,
+            "max": 32000,
+            "sgd_var": "ezpl.print_width",
+        },
+        "label_length": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Label length in dots (e.g. 430 for ~2.12\" at 203 dpi, 1200 for ~5.9\" at 203 dpi)",
+            "min": 1,
+            "max": 32000,
+            "sgd_var": "zpl.label_length",
+        },
+        "speed": {
+            "type": "number",
+            "unit": "ips",
+            "description": "Print speed in inches per second (e.g. 2.0, 3.0, 4.0, 5.0, 6.0)",
+            "min": 2.0,
+            "max": 14.0,
+            "sgd_var": "media.speed",
+        },
+        "darkness": {
+            "type": "number",
+            "unit": "tone",
+            "description": "Print darkness / head tone (0.0 to 30.0)",
+            "min": 0.0,
+            "max": 30.0,
+            "sgd_var": "print.tone",
+        },
+        "resolution_dpi": {
+            "type": "integer",
+            "read_only": True,
+            "unit": "dpi",
+            "description": "Hardware printhead resolution in dots per inch (e.g. 203, 300, 600)",
+            "sgd_var": "head.resolution.in_dpi",
+        },
+        "label_top": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Top margin / vertical image position offset in dots (e.g. -120 to 120, positive shifts image down)",
+            "sgd_var": "zpl.label_top",
+        },
+        "top_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for label_top (top margin offset in dots)",
+            "sgd_var": "zpl.label_top",
+        },
+        "left_position": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Left margin / horizontal image position offset in dots (-9999 to 9999, positive shifts image right)",
+            "sgd_var": "zpl.left_position",
+        },
+        "left_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for left_position (left margin offset in dots)",
+            "sgd_var": "zpl.left_position",
+        },
+        "tear_off": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Bottom / tear-off position adjustment in dots (-120 to 120)",
+            "sgd_var": "ezpl.tear_off",
+        },
+        "bottom_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Alias for tear_off (bottom margin / tear line adjustment in dots)",
+            "sgd_var": "ezpl.tear_off",
+        },
+        "right_margin": {
+            "type": "integer",
+            "unit": "dots",
+            "description": "Right margin offset in dots (adjusts printable width ezpl.print_width = width - right_margin)",
+        },
+        "margins": {
+            "type": "object",
+            "description": "Composite margin settings: {top, left, bottom, right} in dots",
+            "properties": {
+                "top": "integer (dots, shifts down/up via zpl.label_top)",
+                "left": "integer (dots, shifts right/left via zpl.left_position)",
+                "bottom": "integer (dots, adjusts tear-off position via ezpl.tear_off)",
+                "right": "integer (dots, reduces ezpl.print_width)",
+            },
+        },
+        "save_to_flash": {
+            "type": "boolean",
+            "default": False,
+            "description": "Persist configuration changes permanently to non-volatile printer memory (^JUS command)",
+        },
+    },
+    "example_payload": {
+        "print_method": "direct thermal",
+        "print_width": 609,
+        "label_length": 430,
+        "media_type": "gap/notch",
+        "print_mode": "tear off",
+        "speed": 6.0,
+        "darkness": 30.0,
+        "top_margin": 10,
+        "left_margin": 15,
+        "bottom_margin": 0,
+        "right_margin": 0,
+        "save_to_flash": True,
+    },
+}
+
+
+def get_printer_sgd_config(ip: str, port: int = 9100, timeout: float = 3.0) -> Dict:
+    """Query live configuration from a Zebra printer using SGD (Set/Get/Do) read-only queries."""
+    sock = connect_smart_socket(ip, port, timeout=timeout)
+    if not sock:
+        raise ConnectionError(f"Cannot connect to printer at {ip}:{port}")
+
+    queries = {
+        "model": "device.product_name",
+        "friendly_name": "device.friendly_name",
+        "serial_number": "device.unique_id",
+        "firmware": "appl.name",
+        "dpi": "head.resolution.in_dpi",
+        "print_method": "ezpl.print_method",
+        "print_width": "ezpl.print_width",
+        "label_length": "zpl.label_length",
+        "media_type": "ezpl.media_type",
+        "print_mode": "ezpl.print_mode",
+        "speed": "media.speed",
+        "darkness": "print.tone",
+        "label_top": "zpl.label_top",
+        "left_position": "zpl.left_position",
+        "tear_off": "ezpl.tear_off",
+        "status": "display.text",
+    }
+
+    raw = {}
+    for key, var in queries.items():
+        try:
+            sock.sendall(f"! U1 getvar \"{var}\"\r\n".encode("utf-8"))
+            time.sleep(0.04)
+            val = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+            raw[key] = val
+        except Exception:
+            raw[key] = None
+
+    sock.close()
+
+    dpi_val = int(raw["dpi"]) if raw.get("dpi") and raw["dpi"].isdigit() else 203
+    width_dots = int(raw["print_width"]) if raw.get("print_width") and raw["print_width"].isdigit() else None
+    length_dots = int(raw["label_length"]) if raw.get("label_length") and raw["label_length"].isdigit() else None
+    speed_ips = float(raw["speed"]) if raw.get("speed") and raw["speed"].replace(".", "", 1).isdigit() else None
+    darkness_tone = float(raw["darkness"]) if raw.get("darkness") and raw["darkness"].replace(".", "", 1).isdigit() else None
+    label_top_val = int(raw["label_top"].strip()) if raw.get("label_top") and raw["label_top"].strip().lstrip("-").isdigit() else 0
+    left_pos_val = int(raw["left_position"].strip()) if raw.get("left_position") and raw["left_position"].strip().lstrip("-").isdigit() else 0
+    tear_off_val = int(raw["tear_off"].strip()) if raw.get("tear_off") and raw["tear_off"].strip().lstrip("-").isdigit() else 0
+
+    width_inches = round(width_dots / dpi_val, 2) if width_dots and dpi_val else None
+    length_inches = round(length_dots / dpi_val, 2) if length_dots and dpi_val else None
+
+    method = raw.get("print_method") or ""
+    if "thermal trans" in method:
+        method = "thermal transfer"
+    elif "direct thermal" in method or "direct" in method:
+        method = "direct thermal"
+
+    return {
+        "model": raw.get("model") or "Zebra Printer",
+        "friendly_name": raw.get("friendly_name") or "",
+        "serial_number": raw.get("serial_number") or "",
+        "firmware": raw.get("firmware") or "",
+        "status": " ".join((raw.get("status") or "").split()),
+        "config": {
+            "dpi": dpi_val,
+            "print_method": method,
+            "print_width_dots": width_dots,
+            "print_width_inches": width_inches,
+            "label_length_dots": length_dots,
+            "label_length_inches": length_inches,
+            "media_type": raw.get("media_type"),
+            "print_mode": raw.get("print_mode"),
+            "speed_ips": speed_ips,
+            "darkness": darkness_tone,
+            "label_top": label_top_val,
+            "left_position": left_pos_val,
+            "tear_off": tear_off_val,
+            "margins": {
+                "top": label_top_val,
+                "left": left_pos_val,
+                "bottom": tear_off_val,
+                "right": None,
+                "print_width_dots": width_dots,
+            },
+        },
+    }
+
+
+def set_printer_sgd_config(
+    ip: str, port: int = 9100, settings: Dict = None, timeout: float = 3.0
+) -> Tuple[bool, Dict, Optional[str]]:
+    """Apply configuration parameters to a Zebra printer via SGD without printing."""
+    if not settings:
+        return True, {}, None
+
+    settings = dict(settings)
+
+    margins_input = settings.get("margins")
+    if isinstance(margins_input, dict):
+        if "top" in margins_input or "top_margin" in margins_input:
+            settings.setdefault("top_margin", margins_input.get("top", margins_input.get("top_margin")))
+        if "left" in margins_input or "left_margin" in margins_input:
+            settings.setdefault("left_margin", margins_input.get("left", margins_input.get("left_margin")))
+        if "bottom" in margins_input or "bottom_margin" in margins_input:
+            settings.setdefault("bottom_margin", margins_input.get("bottom", margins_input.get("bottom_margin")))
+        if "right" in margins_input or "right_margin" in margins_input:
+            settings.setdefault("right_margin", margins_input.get("right", margins_input.get("right_margin")))
+
+    # If right_margin is specified along with print_width, adjust print_width
+    for rm_key in ("right_margin", "margin_right", "right"):
+        if rm_key in settings and settings[rm_key] is not None:
+            for pw_key in ("print_width", "width"):
+                if pw_key in settings and settings[pw_key] is not None:
+                    try:
+                        settings[pw_key] = max(int(settings[pw_key]) - int(settings[rm_key]), 100)
+                    except (ValueError, TypeError):
+                        pass
+            break
+
+    sock = connect_smart_socket(ip, port, timeout=timeout)
+    if not sock:
+        return False, {}, f"Cannot connect to printer at {ip}:{port}"
+
+    applied = {}
+    save_to_flash = bool(settings.get("save_to_flash", False) or settings.get("save", False))
+
+    for user_key, user_val in list(settings.items()):
+        if user_val is None or user_key in ("save_to_flash", "save", "margins"):
+            continue
+        key_norm = user_key.lower().strip()
+
+        sgd_var = None
+        sgd_val = None
+
+        if key_norm in ("print_method", "method"):
+            sgd_var = "ezpl.print_method"
+            val_str = str(user_val).lower().strip()
+            if "direct" in val_str or val_str == "dt":
+                sgd_val = "direct thermal"
+            elif "trans" in val_str or val_str == "tt":
+                sgd_val = "thermal trans"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("print_width", "width"):
+            sgd_var = "ezpl.print_width"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("label_length", "length"):
+            sgd_var = "zpl.label_length"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("media_type", "type"):
+            sgd_var = "ezpl.media_type"
+            val_str = str(user_val).lower().strip()
+            if "gap" in val_str or "notch" in val_str:
+                sgd_val = "gap/notch"
+            elif "cont" in val_str:
+                sgd_val = "continuous"
+            elif "mark" in val_str:
+                sgd_val = "mark"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("print_mode", "mode"):
+            sgd_var = "ezpl.print_mode"
+            val_str = str(user_val).lower().strip()
+            if "tear" in val_str:
+                sgd_val = "tear off"
+            elif "peel" in val_str:
+                sgd_val = "peel off"
+            elif "rewind" in val_str:
+                sgd_val = "rewind"
+            elif "cutter" in val_str or "cut" in val_str:
+                sgd_val = "cutter"
+            else:
+                sgd_val = val_str
+
+        elif key_norm in ("speed", "print_speed"):
+            sgd_var = "media.speed"
+            sgd_val = f"{float(user_val):.1f}"
+
+        elif key_norm in ("darkness", "tone"):
+            sgd_var = "print.tone"
+            sgd_val = f"{float(user_val):.1f}"
+
+        elif key_norm in ("label_top", "top_margin", "margin_top", "top"):
+            sgd_var = "zpl.label_top"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("left_position", "left_margin", "margin_left", "left"):
+            sgd_var = "zpl.left_position"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("tear_off", "bottom_margin", "margin_bottom", "bottom"):
+            sgd_var = "ezpl.tear_off"
+            sgd_val = str(int(user_val))
+
+        elif key_norm in ("right_margin", "margin_right", "right"):
+            right_val = int(user_val)
+            explicit_width = settings.get("print_width", settings.get("width"))
+            if explicit_width is not None:
+                sgd_var = "ezpl.print_width"
+                sgd_val = str(int(explicit_width))
+            else:
+                try:
+                    sock.sendall(b'! U1 getvar "ezpl.print_width"\r\n')
+                    time.sleep(0.04)
+                    cur_w_str = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+                    base_w = int(cur_w_str) if cur_w_str.isdigit() else 832
+                except Exception:
+                    base_w = 832
+                new_w = max(base_w - right_val, 100) if right_val > 0 else base_w
+                sgd_var = "ezpl.print_width"
+                sgd_val = str(new_w)
+
+        elif "." in user_key:
+            # Direct/arbitrary SGD variable (e.g. "device.friendly_name", "zpl.format_prefix")
+            sgd_var = user_key.strip()
+            sgd_val = str(user_val)
+
+        elif key_norm in ("raw_command", "command", "raw_sgd"):
+            cmd = str(user_val).strip()
+            if not cmd.endswith("\r\n"):
+                cmd += "\r\n"
+            sock.sendall(cmd.encode("utf-8"))
+            time.sleep(0.06)
+            try:
+                resp = sock.recv(1024).decode("utf-8", errors="ignore").strip()
+            except Exception:
+                resp = "sent"
+            applied[user_key] = resp or "sent"
+            continue
+
+        if sgd_var and sgd_val is not None:
+            set_cmd = f'! U1 setvar "{sgd_var}" "{sgd_val}"\r\n'.encode("utf-8")
+            sock.sendall(set_cmd)
+            time.sleep(0.05)
+            get_cmd = f'! U1 getvar "{sgd_var}"\r\n'.encode("utf-8")
+            sock.sendall(get_cmd)
+            time.sleep(0.05)
+            read_back = sock.recv(1024).decode("utf-8", errors="ignore").strip().strip('"')
+            applied[user_key] = read_back or sgd_val
+
+    if isinstance(margins_input, dict):
+        applied["margins"] = {
+            "top": applied.get("top_margin", applied.get("label_top", applied.get("top"))),
+            "left": applied.get("left_margin", applied.get("left_position", applied.get("left"))),
+            "bottom": applied.get("bottom_margin", applied.get("tear_off", applied.get("bottom"))),
+            "right": applied.get("right_margin", applied.get("right")),
+        }
+
+    if save_to_flash:
+        # ^XA^JUS^XZ instructs the Zebra printer to persist settings to non-volatile memory (EEPROM)
+        sock.sendall(b"^XA^JUS^XZ\r\n")
+        time.sleep(0.05)
+        applied["save_to_flash"] = True
+
+    sock.close()
+    return True, applied, None
