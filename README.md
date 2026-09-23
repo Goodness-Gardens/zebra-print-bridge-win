@@ -948,6 +948,7 @@ zebra-print-bridge-win/
 │   ├── main.py            # PrintBridge core (queue, resolution glue) + CLI entry point
 │   ├── printer_manager.py # Target resolution, SNMP/ARP identity, discovery, cache, network/local sending
 │   ├── server.py          # FastAPI HTTP server and endpoints
+│   ├── suitelet_sync.py   # NetSuite Suitelet server synchronization client
 │   ├── updater.py         # Auto-update checker (GitHub raw version.json + Releases)
 │   └── utils.py           # IP/MAC/hostname helpers, ARP lookups, safe subprocess wrapper
 ├── resources/
