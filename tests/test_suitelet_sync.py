@@ -163,3 +163,52 @@ async def test_server_sync_endpoint():
         resp_get = await client.get("/api/server/sync")
         assert resp_get.status_code == 200
         assert resp_get.json() == mock_sync_result
+
+
+def test_suitelet_sync_manager_defaults_to_production():
+    import copy
+    cfg = Config.__new__(Config)
+    cfg.config_dir = None
+    cfg.config_file = MagicMock(exists=lambda: False)
+    cfg._config = copy.deepcopy(Config.DEFAULT_CONFIG)
+    cfg._load = lambda: None
+
+    mgr = SuiteletSyncManager(config=cfg, get_server_info=lambda: {
+        "ip": "192.168.1.50",
+        "mac": "11:22:33:44:55:66",
+        "port": 5050,
+        "name": "Windows PC",
+    })
+
+    assert mgr.is_configured() is True
+    assert mgr.is_enabled() is True
+    assert "7386" in mgr.get_base_url()
+    assert "1224776.extforms.netsuite.com" in mgr.get_base_url()
+
+    mock_resp = MagicMock()
+    mock_resp.status = 200
+    mock_resp.read.return_value = json.dumps({"success": True}).encode("utf-8")
+
+    with patch("app.suitelet_sync.urlopen") as mock_urlopen:
+        mock_urlopen.return_value.__enter__.return_value = mock_resp
+        res = mgr.sync_now()
+
+    assert res["success"] is True
+    req = mock_urlopen.call_args[0][0]
+    assert "script=7386" in req.full_url
+    assert "11" in req.full_url
+
+
+def test_config_migration_empty_url_restores_production_default(tmp_path):
+    old_config = tmp_path / "config.json"
+    old_config.write_text(json.dumps({
+        "port": 5050,
+        "suitelet_sync_url": "",
+        "suitelet_sync_enabled": False,
+    }), encoding="utf-8")
+
+    cfg = Config(config_path=str(tmp_path))
+    assert cfg.suitelet_sync_enabled is True
+    assert "7386" in cfg.suitelet_sync_url
+    assert "1224776.extforms.netsuite.com" in cfg.suitelet_sync_url
+

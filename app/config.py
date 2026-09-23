@@ -15,6 +15,11 @@ class Config:
     Stores settings in the user's home directory.
     """
 
+    DEFAULT_SUITELET_SYNC_URL = (
+        "https://1224776.extforms.netsuite.com/app/site/hosting/scriptlet.nl"
+        "?script=7386&deploy=1&compid=1224776&ns-at=AAEJ7tMQ6DO6mA03ZmQeoVF6pImvjQA8oZjVTecPH-ZTK2316cU"
+    )
+
     DEFAULT_CONFIG = {
         'port': 5050,
         'scan_network': True,
@@ -26,10 +31,10 @@ class Config:
         'verify_identity': True,
         'strict_identity': False,
         'discovery_broadcast': False,
-        'suitelet_sync_enabled': False,
-        'suitelet_sync_url': '',
-        'suitelet_account_id': '1224776-sb1',
-        'suitelet_compid': '1224776-sb1',
+        'suitelet_sync_enabled': True,
+        'suitelet_sync_url': DEFAULT_SUITELET_SYNC_URL,
+        'suitelet_account_id': '1224776',
+        'suitelet_compid': '1224776',
         'suitelet_sync_hash': '',
         'suitelet_sync_interval_seconds': 0,
         'server_name': '',
@@ -62,6 +67,12 @@ class Config:
                 with open(self.config_file, 'r', encoding='utf-8') as f:
                     saved_config = json.load(f)
                     self._config.update(saved_config)
+
+                # Migration/fallback: if saved_config didn't specify suitelet_sync_url or it's empty, use default production URL
+                if not (self._config.get('suitelet_sync_url') or '').strip():
+                    self._config['suitelet_sync_url'] = self.DEFAULT_SUITELET_SYNC_URL
+                    self._config['suitelet_sync_enabled'] = True
+
                 logger.info("Loaded config from %s", self.config_file)
             except Exception as e:
                 logger.error("Error loading config: %s", e)
@@ -146,7 +157,7 @@ class Config:
 
     @property
     def suitelet_sync_enabled(self) -> bool:
-        return bool(self._config.get('suitelet_sync_enabled', False))
+        return bool(self._config.get('suitelet_sync_enabled', True))
 
     @suitelet_sync_enabled.setter
     def suitelet_sync_enabled(self, value: bool):
@@ -155,7 +166,8 @@ class Config:
 
     @property
     def suitelet_sync_url(self) -> str:
-        return self._config.get('suitelet_sync_url', '')
+        val = (self._config.get('suitelet_sync_url') or '').strip()
+        return val or self.DEFAULT_SUITELET_SYNC_URL
 
     @suitelet_sync_url.setter
     def suitelet_sync_url(self, value: str):
@@ -164,7 +176,7 @@ class Config:
 
     @property
     def suitelet_account_id(self) -> str:
-        return self._config.get('suitelet_account_id', '1224776-sb1')
+        return self._config.get('suitelet_account_id', '1224776')
 
     @suitelet_account_id.setter
     def suitelet_account_id(self, value: str):
@@ -173,7 +185,7 @@ class Config:
 
     @property
     def suitelet_compid(self) -> str:
-        return self._config.get('suitelet_compid', '1224776-sb1')
+        return self._config.get('suitelet_compid', '1224776')
 
     @suitelet_compid.setter
     def suitelet_compid(self, value: str):
@@ -217,7 +229,12 @@ class Config:
         self._save()
 
     def get(self, key: str, default=None):
-        return self._config.get(key, default)
+        val = self._config.get(key, default)
+        if key == 'suitelet_sync_url' and not (val or '').strip():
+            return self.DEFAULT_SUITELET_SYNC_URL
+        if key == 'suitelet_sync_enabled' and val is None:
+            return True
+        return val
 
     def set(self, key: str, value):
         self._config[key] = value
