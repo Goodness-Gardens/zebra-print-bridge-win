@@ -213,9 +213,9 @@ The desktop app fetches `version.json` from the raw content of the `main` branch
 
 ```json
 {
-  "version": "1.2.0",
-  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.2.0/ZebraBridgeSetup_1.2.0.exe",
-  "notes": "Added GUI scanned network printers (hostname & IP) and local Windows devices list; removed unused code and dependencies."
+  "version": "1.3.0",
+  "download_url": "https://github.com/Goodness-Gardens/zebra-print-bridge-win/releases/download/v1.3.0/ZebraBridgeSetup_1.3.0.exe",
+  "notes": "Added NetSuite Suitelet server synchronization with background heartbeat and on-demand sync."
 }
 ```
 
@@ -285,7 +285,7 @@ For browsers (`Accept: text/html` or a Mozilla user agent), redirects to `/dashb
 {
   "status": "running",
   "service": "Zebra Print Bridge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "server_hostname": "PRINT-PC",
   "hostname": "PRINT-PC",
   "mode": "raw_printing"
@@ -307,7 +307,7 @@ Server info including network address, MAC and the accepted targets.
 ```json
 {
   "service": "Zebra Print Bridge",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "server_hostname": "PRINT-PC",
   "hostname": "PRINT-PC",
   "mode": "raw_printing",
