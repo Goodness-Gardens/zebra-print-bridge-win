@@ -42,6 +42,19 @@ def test_build_suitelet_sync_url_defaults():
     assert "url=http%3A%2F%2F192.168.10.115%3A5050" in url
 
 
+def test_build_suitelet_sync_url_without_priority():
+    url = build_suitelet_sync_url(
+        mac="62:39:a2:0d:a4:b5",
+        ip="192.168.10.115",
+        port=5050,
+        name="Miami Yaki PC",
+        priority=None,
+    )
+    assert "priority=" not in url
+    assert "name=Miami+Yaki+PC" in url
+    assert "ip=192.168.10.115" in url
+
+
 def test_build_suitelet_sync_url_with_placeholders():
     template = (
         "https://<ACCOUNT_ID>.extforms.netsuite.com/app/site/hosting/scriptlet.nl"

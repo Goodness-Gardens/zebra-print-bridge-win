@@ -33,7 +33,7 @@ class Config:
         'suitelet_sync_hash': '',
         'suitelet_sync_interval_seconds': 0,
         'server_name': '',
-        'server_priority': 1,
+        'server_priority': None,
     }
 
     def __init__(self, config_path: str = None):
@@ -209,7 +209,7 @@ class Config:
 
     @property
     def server_priority(self) -> Optional[int]:
-        return self._config.get('server_priority', 1)
+        return self._config.get('server_priority', None)
 
     @server_priority.setter
     def server_priority(self, value: Optional[int]):

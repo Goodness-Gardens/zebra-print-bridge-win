@@ -28,7 +28,7 @@ DEFAULT_COMPID = "1224776-sb1"
 
 
 def mask_url_sensitive_params(url_str: str) -> str:
-    """Mask the hash parameter 'h' in logs and status responses for security."""
+    """Mask sensitive token/hash parameters ('h', 'ns-at') in logs and status responses for security."""
     if not url_str:
         return ""
     try:
@@ -39,7 +39,7 @@ def mask_url_sensitive_params(url_str: str) -> str:
                 return f"{prefix}{val[:3]}***{val[-3:]}"
             return f"{prefix}***"
 
-        return re.sub(r"([?&]h=)([^&#]+)", _repl, url_str)
+        return re.sub(r"([?&](?:h|ns-at)=)([^&#]+)", _repl, url_str)
     except Exception:
         return url_str
 
@@ -393,7 +393,7 @@ class SuiteletSyncManager:
             "compid": (self.config.get("suitelet_compid") or DEFAULT_COMPID) if self.config else DEFAULT_COMPID,
             "interval_seconds": (self.config.get("suitelet_sync_interval_seconds") or 0) if self.config else 0,
             "server_name": (self.config.get("server_name") or get_hostname()) if self.config else get_hostname(),
-            "server_priority": (self.config.get("server_priority") or 1) if self.config else 1,
+            "server_priority": self.config.get("server_priority") if self.config else None,
             "base_url": mask_url_sensitive_params(self.get_base_url()),
             "last_sync": last_result,
         }
